@@ -185,6 +185,11 @@ class PlaneGame:
         safe_zone_top = (self.height - SAFE_ZONE_HEIGHT) // 2
         safe_zone_bottom = safe_zone_top + SAFE_ZONE_HEIGHT
 
+        # 5 dakika süre sınırı
+        game_duration = 300  # 5 dakika = 300 saniye
+        start_time = time.time()
+        game_completed = False
+
         while self.running:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT: return False
@@ -197,6 +202,13 @@ class PlaneGame:
             ret, frame = self.cap.read()
             if not ret: continue
 
+            # Süre kontrolü
+            elapsed_time = time.time() - start_time
+            remaining_time = max(0, game_duration - elapsed_time)
+
+            if remaining_time <= 0 and not game_completed:
+                game_completed = True
+
             attention_score, landmarks, nose_tip = self.attention_tracker.process_frame(frame)
 
             # Safe zone kontrolü
@@ -207,16 +219,18 @@ class PlaneGame:
                         safe_zone_top <= ny <= safe_zone_bottom):
                     is_in_safe_zone = True
 
-            # YENİ MANTIK: Burun ucu safe zone içindeyse uçak yükselsin, dışındayken alçalsın
-            if is_in_safe_zone:
-                # Safe zone içinde: uçak yükselsin (velocity azalsın, yukarı gitsin)
-                self.plane_velocity = max(-self.max_velocity, self.plane_velocity - 0.2)
-            else:
-                # Safe zone dışında: uçak alçalsın (velocity artsın, aşağı gitsin)
-                self.plane_velocity = min(self.max_velocity, self.plane_velocity + 0.3)
+            # Oyun mantığı sadece süre dolmadıysa çalışsın
+            if not game_completed:
+                # YENİ MANTIK: Burun ucu safe zone içindeyse uçak yükselsin, dışındayken alçalsın
+                if is_in_safe_zone:
+                    # Safe zone içinde: uçak yükselsin (velocity azalsın, yukarı gitsin)
+                    self.plane_velocity = max(-self.max_velocity, self.plane_velocity - 0.2)
+                else:
+                    # Safe zone dışında: uçak alçalsın (velocity artsın, aşağı gitsin)
+                    self.plane_velocity = min(self.max_velocity, self.plane_velocity + 0.3)
 
-            # Uçağın pozisyonunu güncelle
-            self.plane_y = max(100, min(self.height, self.plane_y + self.plane_velocity))
+                # Uçağın pozisyonunu güncelle
+                self.plane_y = max(100, min(self.height, self.plane_y + self.plane_velocity))
 
             self.screen.fill(self.bg_color)
             pygame.draw.rect(self.screen, (50, 60, 70),
@@ -229,11 +243,13 @@ class PlaneGame:
 
             self.draw_plane(self.plane_x, int(self.plane_y), -self.plane_velocity * 5)
 
-            score_text = font.render(f"Dikkat: {attention_score:.2f}", True,
-                                     (0, 255, 0) if attention_score > 0.7 else (255, 0, 0))
-            self.screen.blit(score_text, (10, 10))
+            # Kalan süreyi göster
+            minutes = int(remaining_time // 60)
+            seconds = int(remaining_time % 60)
+            time_text = font.render(f"Kalan Sure: {minutes:02d}:{seconds:02d}", True, (255, 255, 0))
+            self.screen.blit(time_text, (10, 50))
 
-            if nose_tip and self.attention_tracker.calibrated:
+            if nose_tip and self.attention_tracker.calibrated and not game_completed:
                 nx, ny = int(nose_tip[0] * self.width), int(nose_tip[1] * self.height)
                 col = (0, 255, 255) if is_in_safe_zone else (255, 0, 0)
                 pygame.draw.circle(self.screen, col, (nx, ny), 8, 2)
@@ -245,7 +261,10 @@ class PlaneGame:
                         msg = "YUKARI BAK!"
                     self.screen.blit(small_font.render(msg, True, (255, 50, 50)), (nx - 40, ny - 30))
 
-            if self.plane_y >= self.height - 20:
+            if game_completed:
+                self.screen.blit(font.render("OYUN TAMAMLANDI", True, (0, 255, 0)),
+                                 (self.width // 2 - 120, self.height // 2))
+            elif self.plane_y >= self.height - 20:
                 self.screen.blit(font.render("OYUN BITTI", True, (255, 0, 0)), (self.width // 2 - 70, self.height // 2))
 
             pygame.display.flip()
@@ -380,7 +399,7 @@ class ImageDescriptionGame:
         self.current_image = self.round_images[0]
         self.state = "SHOW_IMAGES"
         self.start_time = time.time()
-        self.display_duration = 20
+        self.display_duration = 10
 
     def similarity(self, a, b):
         return SequenceMatcher(None, a.lower(), b.lower()).ratio() * 100
