@@ -1,0 +1,645 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+import pygame
+import math
+from collections import deque
+import time
+import os
+import random
+import requests
+from difflib import SequenceMatcher
+
+# --- HUGGING FACE ---
+import torch
+from PIL import Image
+from transformers import BlipProcessor, BlipForConditionalGeneration
+
+# MediaPipe Ayarları
+mp_face_mesh = mp.solutions.face_mesh
+mp_drawing = mp.solutions.drawing_utils
+mp_drawing_styles = mp.solutions.drawing_styles
+
+# EAR Noktaları
+LEFT_EYE_TOP = 159
+LEFT_EYE_BOTTOM = 145
+LEFT_EYE_LEFT = 33
+LEFT_EYE_RIGHT = 133
+RIGHT_EYE_TOP = 386
+RIGHT_EYE_BOTTOM = 374
+RIGHT_EYE_LEFT = 362
+RIGHT_EYE_RIGHT = 263
+
+
+class AttentionTracker:
+    def __init__(self):
+        self.face_mesh = mp_face_mesh.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        self.eye_history = deque(maxlen=30)
+        self.head_pose_history = deque(maxlen=30)
+        self.attention_score = 1.0
+        self.attention_history = deque(maxlen=10)
+        self.calibrated = False
+        self.base_eye_ratio = 0.25
+        self.base_head_pose = np.array([0, 0, 0])
+
+    def calculate_ear(self, landmarks, top_idx, bottom_idx, left_idx, right_idx):
+        try:
+            if len(landmarks) < 468: return 0.3
+            vertical = np.linalg.norm(np.array([landmarks[top_idx].x, landmarks[top_idx].y]) - np.array(
+                [landmarks[bottom_idx].x, landmarks[bottom_idx].y]))
+            horizontal = np.linalg.norm(np.array([landmarks[left_idx].x, landmarks[left_idx].y]) - np.array(
+                [landmarks[right_idx].x, landmarks[right_idx].y]))
+            if horizontal == 0: return 0.3
+            ear = vertical / horizontal
+            return max(0.0, min(1.0, ear))
+        except:
+            return 0.3
+
+    def calculate_head_pose(self, landmarks, image_shape):
+        try:
+            if len(landmarks) < 468: return np.array([0, 0, 0])
+            image_points = np.array([
+                [landmarks[1].x * image_shape[1], landmarks[1].y * image_shape[0]],
+                [landmarks[33].x * image_shape[1], landmarks[33].y * image_shape[0]],
+                [landmarks[263].x * image_shape[1], landmarks[263].y * image_shape[0]],
+                [landmarks[61].x * image_shape[1], landmarks[61].y * image_shape[0]],
+                [landmarks[291].x * image_shape[1], landmarks[291].y * image_shape[0]],
+                [landmarks[4].x * image_shape[1], landmarks[4].y * image_shape[0]]
+            ], dtype=np.float64)
+            model_points = np.array([
+                [0.0, 0.0, 0.0], [-225.0, 170.0, -135.0], [225.0, 170.0, -135.0],
+                [-150.0, -150.0, -125.0], [150.0, -150.0, -125.0], [0.0, -330.0, -65.0]
+            ], dtype=np.float64)
+            focal_length = image_shape[1]
+            center = (image_shape[1] / 2, image_shape[0] / 2)
+            camera_matrix = np.array([[focal_length, 0, center[0]], [0, focal_length, center[1]], [0, 0, 1]],
+                                     dtype=np.float64)
+            dist_coeffs = np.zeros((4, 1))
+            success, rotation_vector, translation_vector = cv2.solvePnP(model_points, image_points, camera_matrix,
+                                                                        dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE)
+            if success:
+                rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
+                sy = np.sqrt(
+                    rotation_matrix[0, 0] * rotation_matrix[0, 0] + rotation_matrix[1, 0] * rotation_matrix[1, 0])
+                if sy < 1e-6:
+                    x = np.arctan2(-rotation_matrix[1, 2], rotation_matrix[1, 1]) * 180 / np.pi
+                    y = np.arctan2(-rotation_matrix[2, 0], sy) * 180 / np.pi
+                    z = 0
+                else:
+                    x = np.arctan2(rotation_matrix[2, 1], rotation_matrix[2, 2]) * 180 / np.pi
+                    y = np.arctan2(-rotation_matrix[2, 0], sy) * 180 / np.pi
+                    z = np.arctan2(rotation_matrix[1, 0], rotation_matrix[0, 0]) * 180 / np.pi
+                return np.array([y, z, x])
+            return np.array([0, 0, 0])
+        except:
+            return np.array([0, 0, 0])
+
+    def process_frame(self, frame):
+        try:
+            if frame is None or frame.size == 0: return self.attention_score, None, None
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = self.face_mesh.process(rgb_frame)
+            if not results.multi_face_landmarks:
+                if self.calibrated: self.attention_score = max(0.0, self.attention_score - 0.05)
+                return self.attention_score, None, None
+            landmarks = results.multi_face_landmarks[0].landmark
+            left_ear = self.calculate_ear(landmarks, LEFT_EYE_TOP, LEFT_EYE_BOTTOM, LEFT_EYE_LEFT, LEFT_EYE_RIGHT)
+            right_ear = self.calculate_ear(landmarks, RIGHT_EYE_TOP, RIGHT_EYE_BOTTOM, RIGHT_EYE_LEFT, RIGHT_EYE_RIGHT)
+            avg_ear = (left_ear + right_ear) / 2.0
+            head_pose = self.calculate_head_pose(landmarks, frame.shape)
+            if not self.calibrated:
+                self.eye_history.append(avg_ear)
+                self.head_pose_history.append(head_pose.copy())
+                if len(self.eye_history) >= 30:
+                    self.base_eye_ratio = np.mean(self.eye_history)
+                    self.base_head_pose = np.mean(self.head_pose_history, axis=0)
+                    self.calibrated = True
+            else:
+                eye_ratio = avg_ear / self.base_eye_ratio if self.base_eye_ratio > 0 else 1.0
+                eye_score = 1.0
+                if eye_ratio < 0.7: eye_score = max(0.0, eye_ratio / 0.25) * 0.1
+
+                yaw_diff = abs(head_pose[1] - self.base_head_pose[1])
+                yaw_score = 1.0
+                if yaw_diff > 8: yaw_score = max(0.0, 0.1 - (yaw_diff - 25) * 0.01)
+
+                head_score = yaw_score
+                raw_score = (eye_score * 0.65 + head_score * 0.35)
+                self.attention_history.append(raw_score)
+                if len(self.attention_history) >= 3:
+                    self.attention_score = sum(self.attention_history) / len(self.attention_history)
+                else:
+                    self.attention_score = raw_score
+                self.attention_score = max(0.0, min(1.0, self.attention_score))
+
+            nose_tip = (landmarks[4].x, landmarks[4].y) if results.multi_face_landmarks else None
+            return self.attention_score, results.multi_face_landmarks, nose_tip
+        except:
+            return self.attention_score, None, None
+
+
+# ----------------- OYUN SINIFLARI -----------------
+
+class PlaneGame:
+    def __init__(self, screen, width, height, clock):
+        self.screen = screen
+        self.width = width
+        self.height = height
+        self.clock = clock
+        self.plane_x = self.width // 2
+        self.plane_y = self.height // 2
+        self.plane_velocity = 0
+        self.max_velocity = 5
+        self.running = True
+        self.attention_tracker = AttentionTracker()
+        self.cap = None
+        self.bg_color = (20, 30, 40)
+        self.clouds = [
+            {'x': np.random.randint(0, width), 'y': np.random.randint(0, height), 'size': np.random.randint(30, 60)} for
+            _ in range(5)]
+
+    def init_camera(self):
+        self.cap = cv2.VideoCapture(0)
+        return self.cap.isOpened()
+
+    def draw_plane(self, x, y, angle):
+        body_points = [(x, y - 20), (x - 8, y - 5), (x - 12, y + 8), (x, y + 12), (x + 12, y + 8), (x + 8, y - 5)]
+        pygame.draw.polygon(self.screen, (120, 180, 220), body_points)
+        pygame.draw.polygon(self.screen, (100, 160, 240), [(x - 12, y + 2), (x - 20, y + 5), (x - 12, y + 8)])
+        pygame.draw.polygon(self.screen, (100, 160, 240), [(x + 12, y + 2), (x + 20, y + 5), (x + 12, y + 8)])
+
+    def run(self):
+        if not self.init_camera(): return False
+        font = pygame.font.Font(None, 36)
+        small_font = pygame.font.Font(None, 24)
+
+        SAFE_ZONE_WIDTH = 200
+        SAFE_ZONE_HEIGHT = 400
+        safe_zone_left = (self.width - SAFE_ZONE_WIDTH) // 2
+        safe_zone_right = safe_zone_left + SAFE_ZONE_WIDTH
+        safe_zone_top = (self.height - SAFE_ZONE_HEIGHT) // 2
+        safe_zone_bottom = safe_zone_top + SAFE_ZONE_HEIGHT
+
+        while self.running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT: return False
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE: return False
+                    if event.key == pygame.K_BACKSPACE:
+                        self.cap.release()
+                        return True
+
+            ret, frame = self.cap.read()
+            if not ret: continue
+
+            attention_score, landmarks, nose_tip = self.attention_tracker.process_frame(frame)
+
+            is_in_safe_zone = True
+            if nose_tip:
+                nx, ny = int(nose_tip[0] * self.width), int(nose_tip[1] * self.height)
+                if nx < safe_zone_left or nx > safe_zone_right or ny < safe_zone_top or ny > safe_zone_bottom:
+                    is_in_safe_zone = False
+                    attention_score = max(0.0, attention_score - 0.5)
+
+            if attention_score > 0.7:
+                self.plane_velocity = max(-self.max_velocity, self.plane_velocity - 0.2)
+            else:
+                self.plane_velocity = min(self.max_velocity, self.plane_velocity + 0.3)
+
+            self.plane_y = max(100, min(self.height, self.plane_y + self.plane_velocity))
+
+            self.screen.fill(self.bg_color)
+            pygame.draw.rect(self.screen, (50, 60, 70),
+                             (safe_zone_left, safe_zone_top, SAFE_ZONE_WIDTH, SAFE_ZONE_HEIGHT), 2)
+
+            for c in self.clouds:
+                c['x'] -= 1
+                if c['x'] < -100: c['x'], c['y'] = self.width + 100, np.random.randint(0, self.height)
+                pygame.draw.circle(self.screen, (200, 200, 200), (c['x'], c['y']), c['size'])
+
+            self.draw_plane(self.plane_x, int(self.plane_y), -self.plane_velocity * 5)
+
+            score_text = font.render(f"Dikkat: {attention_score:.2f}", True,
+                                     (0, 255, 0) if attention_score > 0.7 else (255, 0, 0))
+            self.screen.blit(score_text, (10, 10))
+
+            if nose_tip and self.attention_tracker.calibrated:
+                nx, ny = int(nose_tip[0] * self.width), int(nose_tip[1] * self.height)
+                col = (0, 255, 255) if is_in_safe_zone else (255, 0, 0)
+                pygame.draw.circle(self.screen, col, (nx, ny), 8, 2)
+                if not is_in_safe_zone:
+                    msg = "MERKEZE DON!"
+                    if ny < safe_zone_top:
+                        msg = "ASAGI BAK!"
+                    elif ny > safe_zone_bottom:
+                        msg = "YUKARI BAK!"
+                    self.screen.blit(small_font.render(msg, True, (255, 50, 50)), (nx - 40, ny - 30))
+
+            if self.plane_y >= self.height - 20:
+                self.screen.blit(font.render("OYUN BITTI", True, (255, 0, 0)), (self.width // 2 - 70, self.height // 2))
+
+            pygame.display.flip()
+            self.clock.tick(30)
+
+        if self.cap: self.cap.release()
+        return False
+
+
+class CircleGame:
+    def __init__(self, screen, width, height, clock):
+        self.screen = screen
+        self.width, self.height = width, height
+        self.clock = clock
+        self.running = True
+        self.num_circles = 12
+        self.circle_radius = 30
+        self.center_x, self.center_y = width // 2, height // 2
+        self.circle_radius_distance = 150
+        self.current_index = 0
+        self.jump_interval = 1.0
+        self.last_jump_time = time.time()
+        self.jump_count = 0
+        self.score = 0
+        self.is_double_jump = False
+        self.double_jump_start_time = None
+        self.msg_time = None
+        self.msg_text = ""
+        self.msg_color = (255, 255, 255)
+
+    def run(self):
+        font = pygame.font.Font(None, 48)
+        start_time = time.time()
+        duration = 180
+
+        while self.running:
+            current_time = time.time()
+            if current_time - start_time > duration: break
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT: return False
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE: return False
+                    if event.key == pygame.K_BACKSPACE: return True
+                    if event.key == pygame.K_SPACE:
+                        if self.is_double_jump and self.double_jump_start_time:
+                            if current_time - self.double_jump_start_time <= 2.0:
+                                self.score += 10
+                                self.is_double_jump = False
+                                self.double_jump_start_time = None
+                        else:
+                            self.msg_text, self.msg_color, self.msg_time = "YANLIS!", (255, 150, 0), current_time
+
+            if current_time - self.last_jump_time >= self.jump_interval:
+                if self.is_double_jump:
+                    self.msg_text, self.msg_color, self.msg_time = "KACIRDIN!", (255, 50, 50), current_time
+
+                self.last_jump_time = current_time
+                self.jump_count = 2 if np.random.random() < 0.3 else 1
+                self.is_double_jump = (self.jump_count == 2)
+                self.double_jump_start_time = current_time if self.is_double_jump else None
+                self.current_index = (self.current_index + self.jump_count) % self.num_circles
+
+            self.screen.fill((20, 30, 40))
+            for i in range(self.num_circles):
+                angle = (2 * np.pi * i) / self.num_circles
+                x = self.center_x + self.circle_radius_distance * np.cos(angle)
+                y = self.center_y + self.circle_radius_distance * np.sin(angle)
+                col = (255, 200, 50) if i == self.current_index else (100, 200, 255)
+                pygame.draw.circle(self.screen, col, (int(x), int(y)), self.circle_radius)
+
+            self.screen.blit(font.render(f"Skor: {self.score}", True, (255, 255, 255)), (10, 10))
+            if self.msg_time and current_time - self.msg_time < 1.0:
+                text = font.render(self.msg_text, True, self.msg_color)
+                self.screen.blit(text, text.get_rect(center=(self.width // 2, self.height // 2)))
+
+            pygame.display.flip()
+            self.clock.tick(60)
+        return True
+
+
+class ImageDescriptionGame:
+    def __init__(self, screen, width, height, clock):
+        self.screen = screen
+        self.width = width
+        self.height = height
+        self.clock = clock
+        self.running = True
+
+        # Bekleme Ekranı
+        self.screen.fill((20, 30, 40))
+        font = pygame.font.Font(None, 36)
+        txt = font.render("AI Modeli Yukleniyor... Lutfen Bekleyin", True, (255, 255, 255))
+        self.screen.blit(txt, (width // 2 - 250, height // 2))
+        pygame.display.flip()
+
+        print("Model yükleniyor...")
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+        self.model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to(
+            self.device)
+
+        # --- RESİM LİSTESİ HAZIRLIĞI ---
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.photo_folder = os.path.join(script_dir, "fotograflar")
+        if not os.path.exists(self.photo_folder):
+            os.makedirs(self.photo_folder)
+
+        # Klasördeki resimleri bul
+        valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp')
+        self.available_images = [f for f in os.listdir(self.photo_folder) if f.lower().endswith(valid_extensions)]
+
+        # Eğer klasör boşsa yedek indir
+        if not self.available_images:
+            print("Klasör boş, örnek resim indiriliyor...")
+            backup_path = os.path.join(self.photo_folder, "ornek_resim.jpg")
+            try:
+                headers = {'User-Agent': 'Mozilla/5.0'}
+                img_url = "https://picsum.photos/600/400"
+                response = requests.get(img_url, headers=headers, timeout=10)
+                if response.status_code == 200:
+                    with open(backup_path, 'wb') as f:
+                        f.write(response.content)
+                    self.available_images.append("ornek_resim.jpg")
+            except Exception as e:
+                print(f"İndirme hatası: {e}")
+
+        # OYUN AYARLARI
+        self.MAX_ROUNDS = 5
+        self.current_round = 0
+        self.total_score = 0
+        self.round_history = []
+
+        # Resim sırasını karıştır
+        if len(self.available_images) > 0:
+            # Eğer 5'ten az resim varsa listeyi çoğalt ki en az 5 olsun
+            while len(self.available_images) < self.MAX_ROUNDS:
+                self.available_images.extend(self.available_images)
+
+            random.shuffle(self.available_images)
+            # Sadece ilk 5 tanesini al
+            self.game_playlist = self.available_images[:self.MAX_ROUNDS]
+        else:
+            self.game_playlist = []
+
+        self.start_next_round()
+
+    def start_next_round(self):
+        """Yeni bir resim yükler ve raundu başlatır"""
+        self.user_text = ""
+        self.ai_caption = ""
+        self.similarity_score = 0
+        self.current_image = None
+        self.using_fallback = False
+        self.state = "SHOW_IMAGE"
+        self.start_time = time.time()
+        self.display_duration = 20
+        self.current_round += 1
+
+        if self.current_round > self.MAX_ROUNDS:
+            self.state = "GAME_OVER"
+            return
+
+        # Listeden sıradaki resmi al
+        if self.game_playlist:
+            img_name = self.game_playlist[self.current_round - 1]
+            self.image_path = os.path.join(self.photo_folder, img_name)
+
+            try:
+                self.current_image = pygame.image.load(self.image_path)
+                # Boyutlandır
+                img_w, img_h = self.current_image.get_size()
+                scale_ratio = min(500 / img_w, 400 / img_h)
+                new_size = (int(img_w * scale_ratio), int(img_h * scale_ratio))
+                self.current_image = pygame.transform.scale(self.current_image, new_size)
+            except:
+                self.using_fallback = True
+        else:
+            self.using_fallback = True
+
+        if self.using_fallback:
+            self.current_image = pygame.Surface((400, 300))
+            self.current_image.fill((100, 100, 100))
+            font = pygame.font.Font(None, 32)
+            txt = font.render("Resim Yok!", True, (255, 0, 0))
+            self.current_image.blit(txt, (140, 140))
+
+    def similarity(self, a, b):
+        return SequenceMatcher(None, a.lower(), b.lower()).ratio() * 100
+
+    def generate_caption(self):
+        if self.using_fallback: return "Resim yok."
+        try:
+            raw_image = Image.open(self.image_path).convert('RGB')
+            inputs = self.processor(raw_image, return_tensors="pt").to(self.device)
+            out = self.model.generate(**inputs)
+            return self.processor.decode(out[0], skip_special_tokens=True)
+        except Exception as e:
+            return f"Hata: {str(e)}"
+
+    def run(self):
+        font = pygame.font.Font(None, 36)
+        small_font = pygame.font.Font(None, 24)
+        input_box = pygame.Rect(self.width // 2 - 200, self.height // 2, 400, 50)
+
+        while self.running:
+            self.screen.fill((30, 30, 30))
+            current_time = time.time()
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT: return False
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE: return False
+
+                    if self.state == "INPUT":
+                        if event.key == pygame.K_RETURN:
+                            self.state = "PROCESSING"
+                        elif event.key == pygame.K_BACKSPACE:
+                            self.user_text = self.user_text[:-1]
+                        else:
+                            self.user_text += event.unicode
+
+                    elif self.state == "RESULT":
+                        # Sonuç ekranında Enter'a basarsa sonraki resme geç
+                        if event.key == pygame.K_RETURN:
+                            if self.current_round < self.MAX_ROUNDS:
+                                self.start_next_round()
+                            else:
+                                self.state = "GAME_OVER"
+
+            # --- EKRAN DURUMLARI ---
+
+            if self.state == "SHOW_IMAGE":
+                elapsed = current_time - self.start_time
+                remaining = max(0, self.display_duration - elapsed)
+
+                info = font.render(f"Resim {self.current_round}/{self.MAX_ROUNDS} - Incele: {int(remaining)} sn", True,
+                                   (255, 200, 50))
+                self.screen.blit(info, (self.width // 2 - 150, 50))
+
+                if self.current_image:
+                    rect = self.current_image.get_rect(center=(self.width // 2, self.height // 2))
+                    self.screen.blit(self.current_image, rect)
+
+                if remaining <= 0: self.state = "INPUT"
+
+            elif self.state == "INPUT":
+                self.screen.blit(font.render("Gordugunu Ingilizce Betimle:", True, (255, 255, 255)),
+                                 (self.width // 2 - 150, self.height // 2 - 50))
+                pygame.draw.rect(self.screen, (255, 255, 255), input_box, 2)
+                self.screen.blit(font.render(self.user_text, True, (255, 255, 255)),
+                                 (input_box.x + 5, input_box.y + 10))
+                self.screen.blit(small_font.render("Onaylamak icin ENTER'a bas", True, (150, 150, 150)),
+                                 (self.width // 2 - 100, self.height // 2 + 60))
+
+            elif self.state == "PROCESSING":
+                self.screen.blit(font.render("Yapay Zeka Analiz Ediyor...", True, (0, 255, 255)),
+                                 (self.width // 2 - 150, self.height // 2))
+                pygame.display.flip()
+
+                self.ai_caption = self.generate_caption()
+                self.similarity_score = self.similarity(self.user_text, self.ai_caption)
+                self.total_score += self.similarity_score
+                self.state = "RESULT"
+
+            elif self.state == "RESULT":
+                res_font = pygame.font.Font(None, 32)
+                self.screen.blit(res_font.render(f"Senin Cevabin: {self.user_text}", True, (200, 200, 200)), (50, 100))
+                self.screen.blit(res_font.render(f"AI Cevabi: {self.ai_caption}", True, (50, 255, 100)), (50, 150))
+
+                col = (0, 255, 0) if self.similarity_score > 50 else (255, 50, 50)
+                self.screen.blit(font.render(f"Bu Tur Puanin: %{self.similarity_score:.2f}", True, col), (50, 250))
+
+                if self.current_round < self.MAX_ROUNDS:
+                    msg = "SIRADAKI RESIM ICIN ENTER'A BAS"
+                else:
+                    msg = "OYUNU BITIRMEK ICIN ENTER'A BAS"
+
+                # Yanıp sönen yazı efekti
+                if int(time.time() * 2) % 2 == 0:
+                    self.screen.blit(font.render(msg, True, (255, 255, 0)), (50, 350))
+
+            elif self.state == "GAME_OVER":
+                avg_score = self.total_score / self.MAX_ROUNDS
+
+                title = pygame.font.Font(None, 64).render("OYUN BITTI!", True, (0, 255, 255))
+                self.screen.blit(title, (self.width // 2 - 130, 150))
+
+                res_txt = font.render(f"Ortalama Basari: %{avg_score:.2f}", True, (255, 255, 255))
+                self.screen.blit(res_txt, (self.width // 2 - 120, 250))
+
+                self.screen.blit(small_font.render("Menuye donmek icin ESC'ye bas", True, (150, 150, 150)),
+                                 (self.width // 2 - 100, 400))
+
+            pygame.display.flip()
+            self.clock.tick(30)
+        return True
+
+
+class GameManager:
+    def __init__(self):
+        pygame.init()
+        self.width = 800
+        self.height = 600
+        self.screen = pygame.display.set_mode((self.width, self.height))
+        pygame.display.set_caption("NeuroFocus - AI Destekli Eğitim")
+        self.clock = pygame.time.Clock()
+        self.running = True
+        self.bg_color = (20, 30, 40)
+
+    def show_main_menu(self):
+        title_font = pygame.font.Font(None, 64)
+        button_font = pygame.font.Font(None, 48)
+
+        plane_rect = pygame.Rect(self.width // 2 - 150, 200, 300, 60)
+        circle_rect = pygame.Rect(self.width // 2 - 150, 280, 300, 60)
+        desc_rect = pygame.Rect(self.width // 2 - 150, 360, 300, 60)
+
+        selected_game = None
+
+        while selected_game is None and self.running:
+            mouse_pos = pygame.mouse.get_pos()
+            mouse_clicked = False
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.running = False
+                    return None
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    if event.button == 1: mouse_clicked = True
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_1:
+                        selected_game = "plane"
+                    elif event.key == pygame.K_2:
+                        selected_game = "circle"
+                    elif event.key == pygame.K_3:
+                        selected_game = "description"
+                    elif event.key == pygame.K_ESCAPE:
+                        self.running = False
+                        return None
+
+            self.screen.fill(self.bg_color)
+            title = title_font.render("NEURO FOCUS", True, (255, 255, 255))
+            self.screen.blit(title, (self.width // 2 - 150, 80))
+
+            col1 = (70, 170, 70) if plane_rect.collidepoint(mouse_pos) else (50, 150, 50)
+            pygame.draw.rect(self.screen, col1, plane_rect, border_radius=10)
+            self.screen.blit(button_font.render("1. Odak Uçagi", True, (255, 255, 255)),
+                             (plane_rect.x + 40, plane_rect.y + 15))
+
+            col2 = (70, 170, 70) if circle_rect.collidepoint(mouse_pos) else (50, 150, 50)
+            pygame.draw.rect(self.screen, col2, circle_rect, border_radius=10)
+            self.screen.blit(button_font.render("2. Ritim Dairesi", True, (255, 255, 255)),
+                             (circle_rect.x + 30, circle_rect.y + 15))
+
+            col3 = (70, 170, 170) if desc_rect.collidepoint(mouse_pos) else (50, 150, 150)
+            pygame.draw.rect(self.screen, col3, desc_rect, border_radius=10)
+            self.screen.blit(button_font.render("3. Görsel Betimle", True, (255, 255, 255)),
+                             (desc_rect.x + 20, desc_rect.y + 15))
+
+            if mouse_clicked:
+                if plane_rect.collidepoint(mouse_pos):
+                    selected_game = "plane"
+                elif circle_rect.collidepoint(mouse_pos):
+                    selected_game = "circle"
+                elif desc_rect.collidepoint(mouse_pos):
+                    selected_game = "description"
+
+            pygame.display.flip()
+            self.clock.tick(60)
+
+        return selected_game
+
+    def run(self):
+        while self.running:
+            selected = self.show_main_menu()
+            if not self.running or selected is None: break
+
+            if selected == "plane":
+                game = PlaneGame(self.screen, self.width, self.height, self.clock)
+                game.run()
+            elif selected == "circle":
+                game = CircleGame(self.screen, self.width, self.height, self.clock)
+                game.run()
+            elif selected == "description":
+                game = ImageDescriptionGame(self.screen, self.width, self.height, self.clock)
+                game.run()
+
+        pygame.quit()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    try:
+        manager = GameManager()
+        manager.run()
+    except Exception as e:
+        print(f"Hata: {e}")
+        import traceback
+
+        traceback.print_exc()
+        input("Cikmak icin Enter...")
