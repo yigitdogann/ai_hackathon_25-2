@@ -456,29 +456,16 @@ class ImageDescriptionGame:
                         self.state = "INPUT"
 
             elif self.state == "INPUT":
-                # Rastgele seçilen görseli göster ve soru sor
+                # Rastgele seçilen görselin numarasını söyle
                 selected_num = self.selected_image_index + 1
-                question_text = font.render(f"{selected_num}. fotografta neler oldugunu Ingilizce betimle:", True,
-                                            (255, 255, 255))
-                self.screen.blit(question_text, (self.width // 2 - 250, 100))
+                question_text = font.render(f"{selected_num}. fotografi Ingilizce betimle:", True, (255, 255, 255))
+                self.screen.blit(question_text, (self.width // 2 - 200, self.height // 2 - 50))
 
-                # Seçilen görseli küçük olarak göster
-                selected_img = self.round_images[self.selected_image_index]
-                # Görseli küçült ama oranını koru
-                img_w, img_h = selected_img.get_size()
-                scale_ratio = min(250 / img_w, 180 / img_h)
-                new_w, new_h = int(img_w * scale_ratio), int(img_h * scale_ratio)
-                small_img = pygame.transform.scale(selected_img, (new_w, new_h))
-                img_rect = small_img.get_rect(center=(self.width // 2, 200))
-                self.screen.blit(small_img, img_rect)
-
-                # Input box'ı daha aşağıya taşı
-                input_box.y = 300
                 pygame.draw.rect(self.screen, (255, 255, 255), input_box, 2)
                 self.screen.blit(font.render(self.user_text, True, (255, 255, 255)),
                                  (input_box.x + 5, input_box.y + 10))
                 self.screen.blit(small_font.render("Onaylamak icin ENTER'a bas", True, (150, 150, 150)),
-                                 (self.width // 2 - 100, input_box.y + 60))
+                                 (self.width // 2 - 100, self.height // 2 + 60))
 
             elif self.state == "PROCESSING":
                 self.screen.blit(font.render("Yapay Zeka Analiz Ediyor...", True, (0, 255, 255)),
