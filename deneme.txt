@@ -1,0 +1,540 @@
+import pygame
+import sys
+import cv2
+import mediapipe as mp
+import numpy as np
+import math
+from collections import deque
+import os
+import random
+import threading
+from PIL import Image
+
+# ============================================================================
+# HUGGING FACE / LOCAL AI AYARLARI
+# ============================================================================
+try:
+    from transformers import BlipProcessor, BlipForConditionalGeneration
+    import torch
+    HF_AVAILABLE = True
+except ImportError:
+    HF_AVAILABLE = False
+    print("UYARI: transformers kütüphanesi yüklü değil. 'pip install transformers torch' yapın.")
+
+# ============================================================================
+# MEDIAPIPE AYARLARI
+# ============================================================================
+mp_face_mesh = mp.solutions.face_mesh
+mp_drawing = mp.solutions.drawing_utils
+mp_drawing_styles = mp.solutions.drawing_styles
+
+LEFT_EYE_TOP, LEFT_EYE_BOTTOM = 159, 145
+LEFT_EYE_LEFT, LEFT_EYE_RIGHT = 33, 133
+RIGHT_EYE_TOP, RIGHT_EYE_BOTTOM = 386, 374
+RIGHT_EYE_LEFT, RIGHT_EYE_RIGHT = 362, 263
+
+# ============================================================================
+# SINIF: ATTENTION TRACKER
+# ============================================================================
+class AttentionTracker:
+    def __init__(self):
+        self.face_mesh = mp_face_mesh.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=False,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        self.eye_history = deque(maxlen=30)
+        self.head_pose_history = deque(maxlen=30)
+        self.attention_score = 1.0
+        self.attention_history = deque(maxlen=10)
+        
+        self.calibrated = False
+        self.base_eye_ratio = 0.25
+        self.base_head_pose = np.array([0, 0, 0])
+        
+    def calculate_ear(self, landmarks, top, bottom, left, right):
+        try:
+            v = np.linalg.norm(np.array([landmarks[top].x, landmarks[top].y]) - np.array([landmarks[bottom].x, landmarks[bottom].y]))
+            h = np.linalg.norm(np.array([landmarks[left].x, landmarks[left].y]) - np.array([landmarks[right].x, landmarks[right].y]))
+            return v / h if h != 0 else 0.3
+        except: return 0.3
+    
+    def calculate_head_pose(self, landmarks, shape):
+        try:
+            img_pts = np.array([
+                [landmarks[1].x * shape[1], landmarks[1].y * shape[0]],
+                [landmarks[33].x * shape[1], landmarks[33].y * shape[0]],
+                [landmarks[263].x * shape[1], landmarks[263].y * shape[0]],
+                [landmarks[61].x * shape[1], landmarks[61].y * shape[0]],
+                [landmarks[291].x * shape[1], landmarks[291].y * shape[0]],
+                [landmarks[4].x * shape[1], landmarks[4].y * shape[0]]
+            ], dtype=np.float64)
+            
+            model_pts = np.array([
+                [0.0, 0.0, 0.0], [-225.0, 170.0, -135.0], [225.0, 170.0, -135.0],
+                [-150.0, -150.0, -125.0], [150.0, -150.0, -125.0], [0.0, -330.0, -65.0]
+            ], dtype=np.float64)
+            
+            cam_matrix = np.array([[shape[1], 0, shape[1]/2], [0, shape[1], shape[0]/2], [0, 0, 1]], dtype=np.float64)
+            success, rot_vec, _ = cv2.solvePnP(model_pts, img_pts, cam_matrix, np.zeros((4, 1)), flags=cv2.SOLVEPNP_ITERATIVE)
+            
+            if success:
+                rmat, _ = cv2.Rodrigues(rot_vec)
+                sy = np.sqrt(rmat[0, 0]**2 + rmat[1, 0]**2)
+                x = np.arctan2(rmat[2, 1], rmat[2, 2]) * 180 / np.pi
+                y = np.arctan2(-rmat[2, 0], sy) * 180 / np.pi
+                z = np.arctan2(rmat[1, 0], rmat[0, 0]) * 180 / np.pi
+                return np.array([y, z, x])
+            return np.array([0, 0, 0])
+        except: return np.array([0, 0, 0])
+    
+    def process_frame(self, frame):
+        if frame is None: return self.attention_score, None, None
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(rgb)
+        nose = None
+        if results.multi_face_landmarks:
+            lm = results.multi_face_landmarks[0].landmark
+            nose = (lm[4].x, lm[4].y)
+            l_ear = self.calculate_ear(lm, LEFT_EYE_TOP, LEFT_EYE_BOTTOM, LEFT_EYE_LEFT, LEFT_EYE_RIGHT)
+            r_ear = self.calculate_ear(lm, RIGHT_EYE_TOP, RIGHT_EYE_BOTTOM, RIGHT_EYE_LEFT, RIGHT_EYE_RIGHT)
+            avg_ear = (l_ear + r_ear) / 2.0
+            pose = self.calculate_head_pose(lm, frame.shape)
+            
+            if not self.calibrated:
+                self.eye_history.append(avg_ear)
+                self.head_pose_history.append(pose)
+                if len(self.eye_history) >= 30:
+                    self.base_eye_ratio = np.mean(self.eye_history)
+                    self.base_head_pose = np.mean(self.head_pose_history, axis=0)
+                    self.calibrated = True
+            else:
+                ratio = avg_ear / self.base_eye_ratio if self.base_eye_ratio > 0 else 1.0
+                eye_score = 1.0 if ratio >= 0.7 else (ratio / 0.7)
+                yaw_diff = abs(pose[1] - self.base_head_pose[1])
+                pitch_diff = abs(pose[0] - self.base_head_pose[0])
+                head_score = 1.0
+                if yaw_diff > 15: head_score -= (yaw_diff - 15) * 0.05
+                if pitch_diff > 10: head_score -= (pitch_diff - 10) * 0.05
+                head_score = max(0.0, head_score)
+                raw = (eye_score * 0.6) + (head_score * 0.4)
+                self.attention_history.append(raw)
+                self.attention_score = sum(self.attention_history) / len(self.attention_history)
+        else:
+            self.attention_score = max(0.0, self.attention_score - 0.05)
+        return self.attention_score, results.multi_face_landmarks, nose
+
+# ============================================================================
+# SINIF: LOCAL AI QUIZ GENERATOR (HUGGING FACE)
+# ============================================================================
+class LocalQuizGenerator:
+    def __init__(self):
+        self.processor = None
+        self.model = None
+        self.is_loaded = False
+        
+    def load_model(self):
+        """Modeli sadece oyun seçildiğinde yükler (RAM tasarrufu)"""
+        if self.is_loaded or not HF_AVAILABLE: return
+        print("AI Model yükleniyor (BLIP)... Lütfen bekleyin.")
+        # 'Salesforce/blip-image-captioning-base' hafif ve hızlıdır.
+        self.processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+        self.model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+        self.is_loaded = True
+        print("AI Model hazır!")
+
+    def generate_quiz(self, image_path):
+        """Resimden caption üretir ve boşluk doldurmaca sorusu yapar"""
+        if not self.is_loaded:
+            self.load_model()
+            
+        try:
+            raw_image = Image.open(image_path).convert('RGB')
+            # 1. Caption Üret
+            inputs = self.processor(raw_image, return_tensors="pt")
+            out = self.model.generate(**inputs, max_new_tokens=20)
+            caption = self.processor.decode(out[0], skip_special_tokens=True)
+            # Örn: "a red car parked on the street"
+            
+            # 2. Soru Oluştur (Basit Mantık: Son kelimeyi gizle)
+            words = caption.split()
+            if len(words) < 3: 
+                return "Bu resimde ne görüyorsun?", "obje"
+            
+            # Gizlenecek kelimeyi seç (en az 3 harfli bir kelime olsun)
+            target_word = words[-1] # Genelde son kelime ana objedir
+            for w in reversed(words):
+                if len(w) > 3:
+                    target_word = w
+                    break
+            
+            # Soruyu oluştur: "a red car parked on the _____"
+            question_text = caption.replace(target_word, "_______")
+            
+            # Türkçeleştirme (Opsiyonel, basit prompt eklenebilir ama şimdilik ham)
+            final_question = f"Tamamla: {question_text}"
+            final_answer = target_word
+            
+            return final_question, final_answer
+            
+        except Exception as e:
+            print(f"AI Hatası: {e}")
+            return "Resimde ne var?", "hata"
+
+# ============================================================================
+# OYUN 1: UÇAK
+# ============================================================================
+class PlaneGame:
+    def __init__(self, screen, width, height, clock):
+        self.screen = screen
+        self.width = width
+        self.height = height
+        self.clock = clock
+        self.running = True
+        self.cap = None
+        self.bg_color = (20, 30, 40)
+        self.clouds = [{'x': random.randint(0, width), 'y': random.randint(0, height), 'size': random.randint(30, 60)} for _ in range(5)]
+
+    def init_camera(self):
+        if sys.platform == 'darwin':
+            self.cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        else:
+            self.cap = cv2.VideoCapture(0)
+        if not self.cap or not self.cap.isOpened():
+            self.cap = cv2.VideoCapture(1)
+        return self.cap.isOpened()
+
+    def draw_plane(self, x, y, angle):
+        pts = [(x, y-20), (x-8, y-5), (x-12, y+8), (x, y+12), (x+12, y+8), (x+8, y-5)]
+        pygame.draw.polygon(self.screen, (100, 200, 255), pts)
+        pygame.draw.circle(self.screen, (200, 230, 255), (x, y-8), 5)
+
+    def run(self):
+        if not self.init_camera(): return False
+        tracker = AttentionTracker()
+        plane_y = self.height // 2
+        velocity = 0
+        font = pygame.font.Font(None, 36)
+        small = pygame.font.Font(None, 24)
+        SAFE_W, SAFE_H = 200, 400
+        safe_left, safe_top = (self.width - SAFE_W)//2, (self.height - SAFE_H)//2
+        
+        while self.running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT: return False
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE: return False
+                    if event.key == pygame.K_BACKSPACE: 
+                        self.cap.release()
+                        return True
+            ret, frame = self.cap.read()
+            if not ret: continue
+            score, _, nose = tracker.process_frame(frame)
+            in_safe = True
+            if nose:
+                nx, ny = int(nose[0]*self.width), int(nose[1]*self.height)
+                if nx < safe_left or nx > safe_left + SAFE_W or ny < safe_top or ny > safe_top + SAFE_H:
+                    in_safe = False
+                    score = max(0.0, score - 0.5)
+            if score > 0.7: velocity = max(-5, velocity - 0.2)
+            else: velocity = min(5, velocity + 0.3)
+            plane_y += velocity
+            plane_y = max(100, min(self.height, plane_y))
+            
+            self.screen.fill(self.bg_color)
+            pygame.draw.rect(self.screen, (50, 60, 70), (safe_left, safe_top, SAFE_W, SAFE_H), 2)
+            for c in self.clouds:
+                c['x'] -= 1
+                if c['x'] < -50: c['x'], c['y'] = self.width+50, random.randint(0, self.height)
+                pygame.draw.circle(self.screen, (200,200,200), (c['x'], c['y']), c['size'])
+            self.draw_plane(self.width//2, int(plane_y), -velocity*5)
+            col = (0, 255, 0) if score > 0.7 else (255, 0, 0)
+            self.screen.blit(font.render(f"Dikkat: {score:.2f}", True, col), (10, 10))
+            if nose and tracker.calibrated:
+                p_col = (0, 255, 255) if in_safe else (255, 0, 0)
+                pygame.draw.circle(self.screen, p_col, (nx, ny), 8, 2)
+                if not in_safe: self.screen.blit(small.render("MERKEZE!", True, (255,50,50)), (nx-20, ny-30))
+            if not tracker.calibrated: self.screen.blit(small.render("Kalibrasyon...", True, (255,255,255)), (10, 50))
+            pygame.display.flip()
+            self.clock.tick(30)
+        self.cap.release()
+        return False
+
+# ============================================================================
+# OYUN 2: MERDİVEN
+# ============================================================================
+class StairGame:
+    def __init__(self, screen, width, height, clock):
+        self.screen = screen
+        self.width = width
+        self.height = height
+        self.clock = clock
+        self.running = True
+        self.cap = None
+        self.current_step = 0.0
+        self.speed = 0.05
+    
+    def init_camera(self):
+        if sys.platform == 'darwin':
+            self.cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        else:
+            self.cap = cv2.VideoCapture(0)
+        if not self.cap or not self.cap.isOpened():
+            self.cap = cv2.VideoCapture(1)
+        return self.cap.isOpened()
+
+    def run(self):
+        if not self.init_camera(): return False
+        tracker = AttentionTracker()
+        font = pygame.font.Font(None, 36)
+        small = pygame.font.Font(None, 24)
+        SAFE_W, SAFE_H = 200, 400
+        safe_left, safe_top = (self.width - SAFE_W)//2, (self.height - SAFE_H)//2
+        
+        while self.running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT: return False
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE: return False
+                    if event.key == pygame.K_BACKSPACE: 
+                        self.cap.release()
+                        return True
+            ret, frame = self.cap.read()
+            if not ret: continue
+            score, _, nose = tracker.process_frame(frame)
+            in_safe = True
+            if nose:
+                nx, ny = int(nose[0]*self.width), int(nose[1]*self.height)
+                if nx < safe_left or nx > safe_left + SAFE_W or ny < safe_top or ny > safe_top + SAFE_H:
+                    in_safe = False
+                    score = max(0.0, score - 0.5)
+            if score > 0.7 and in_safe: self.current_step += self.speed
+            else: self.current_step -= self.speed
+            
+            self.screen.fill((20, 30, 40))
+            ball_wx, ball_wy = self.current_step * 120, -self.current_step * 50
+            cam_ox, cam_oy = self.width/2 - ball_wx, self.height/2 - ball_wy + 100
+            
+            for i in range(int(self.current_step)-10, int(self.current_step)+12):
+                sx, sy = i*120 + cam_ox, -i*50 + cam_oy
+                pygame.draw.rect(self.screen, (200,200,200), (sx, sy, 120, 50))
+                pygame.draw.polygon(self.screen, (150,150,150), [(sx, sy+50), (sx+120, sy+50), (sx+120, self.height), (sx, self.height)])
+                pygame.draw.line(self.screen, (255,255,255), (sx, sy), (sx+120, sy), 3)
+            
+            jump = math.sin((self.current_step % 1.0) * math.pi) * 60
+            bx = ball_wx + cam_ox + 60
+            by = ball_wy + cam_oy - 15 - jump
+            pygame.draw.circle(self.screen, (255,100,50), (int(bx), int(by)), 15)
+            
+            pygame.draw.rect(self.screen, (50, 60, 70), (safe_left, safe_top, SAFE_W, SAFE_H), 2)
+            col = (0, 255, 0) if score > 0.7 else (255, 0, 0)
+            self.screen.blit(font.render(f"Dikkat: {score:.2f}", True, col), (10, 10))
+            if nose and tracker.calibrated:
+                p_col = (0, 255, 255) if in_safe else (255, 0, 0)
+                pygame.draw.circle(self.screen, p_col, (nx, ny), 8, 2)
+                if not in_safe: self.screen.blit(small.render("MERKEZE!", True, (255,50,50)), (nx-20, ny-30))
+            if not tracker.calibrated: self.screen.blit(small.render("Kalibrasyon...", True, (255,255,255)), (10, 80))
+            pygame.display.flip()
+            self.clock.tick(60)
+        self.cap.release()
+        return False
+
+# ============================================================================
+# OYUN 3: LOCAL AI MEMORY GAME
+# ============================================================================
+class MemoryGame:
+    def __init__(self, screen, width, height, clock):
+        self.screen = screen
+        self.width = width
+        self.height = height
+        self.clock = clock
+        self.running = True
+        self.folder = os.path.join("assets", "memory_images")
+        self.images = []
+        self.ai = LocalQuizGenerator() # Local AI Kullanıyoruz
+        self.load_images()
+        
+        self.state = "LOADING"
+        self.score = 0
+        self.round = 1
+        self.total_rounds = 5
+        self.user_input = ""
+        self.feedback = ""
+        self.img_surf = None
+        self.question = ""
+        self.answer = ""
+        self.ai_loading = False
+
+    def load_images(self):
+        if not os.path.exists(self.folder):
+            os.makedirs(self.folder, exist_ok=True)
+            print("UYARI: assets/memory_images klasörü boş!")
+            return
+        for f in os.listdir(self.folder):
+            if f.lower().endswith(('.png', '.jpg', '.jpeg')):
+                self.images.append(os.path.join(self.folder, f))
+
+    def start_round(self):
+        if not self.images: return
+        self.ai_loading = True
+        path = random.choice(self.images)
+        img = pygame.image.load(path)
+        r = img.get_width() / img.get_height()
+        th = self.height - 200
+        tw = int(th * r)
+        if tw > self.width - 100: tw = self.width - 100; th = int(tw / r)
+        self.img_surf = pygame.transform.scale(img, (tw, th))
+        threading.Thread(target=self.ai_worker, args=(path,), daemon=True).start()
+
+    def ai_worker(self, path):
+        q, a = self.ai.generate_quiz(path)
+        self.question = q
+        self.answer = a
+        self.ai_loading = False
+
+    def run(self):
+        if not self.images:
+            print("Resim yok, oyun başlatılamıyor.")
+            return True
+        self.state = "LOADING"
+        self.score = 0
+        self.round = 1
+        self.start_round()
+        font = pygame.font.Font(None, 40)
+        view_start = 0
+        feedback_start = 0
+        
+        while self.running:
+            for e in pygame.event.get():
+                if e.type == pygame.QUIT: return False
+                if e.type == pygame.KEYDOWN:
+                    if e.key == pygame.K_ESCAPE: return False
+                    if e.key == pygame.K_BACKSPACE: return True
+                    if self.state == "ANSWERING":
+                        if e.key == pygame.K_RETURN:
+                            # Basit kontrol: Cevap kelimesi kullanıcının girdisinde geçiyor mu?
+                            if self.answer.lower() in self.user_input.lower():
+                                self.score += 1
+                                self.feedback = "DOĞRU!"
+                            else:
+                                self.feedback = f"YANLIŞ! Cevap: {self.answer}"
+                            self.state = "FEEDBACK"
+                            feedback_start = time.time()
+                        elif e.key == pygame.K_BACKSPACE: self.user_input = self.user_input[:-1]
+                        else:
+                            if len(self.user_input) < 30 and e.unicode.isprintable(): self.user_input += e.unicode
+
+            self.screen.fill((20, 20, 30))
+            cx, cy = self.width//2, self.height//2
+
+            if self.state == "LOADING":
+                txt = font.render(f"Round {self.round}/{self.total_rounds} Hazırlanıyor...", True, (200, 200, 255))
+                self.screen.blit(txt, txt.get_rect(center=(cx, cy)))
+                if self.ai_loading:
+                    sub = font.render("Yapay Zeka Resmi İnceliyor...", True, (150,150,150))
+                    self.screen.blit(sub, sub.get_rect(center=(cx, cy+50)))
+                else:
+                    self.state = "VIEWING"
+                    view_start = time.time()
+
+            elif self.state == "VIEWING":
+                elapsed = time.time() - view_start
+                remain = 15 - elapsed # 15 saniye bakma süresi
+                if remain <= 0:
+                    self.state = "ANSWERING"
+                    self.user_input = ""
+                else:
+                    self.screen.blit(self.img_surf, self.img_surf.get_rect(center=(cx, cy)))
+                    pygame.draw.rect(self.screen, (50, 100, 255), (0, 0, int((remain/15)*self.width), 10))
+                    self.screen.blit(font.render(f"Detaylara Bak: {int(remain)}s", True, (255,255,0)), (10, 20))
+
+            elif self.state == "ANSWERING":
+                q_surf = font.render(f"SORU: {self.question}", True, (255, 255, 255))
+                self.screen.blit(q_surf, q_surf.get_rect(center=(cx, cy - 100)))
+                rect = pygame.Rect(cx - 200, cy, 400, 50)
+                pygame.draw.rect(self.screen, (255, 255, 255), rect, 2)
+                inp = font.render(self.user_input, True, (255, 255, 255))
+                self.screen.blit(inp, (rect.x + 10, rect.y + 10))
+                self.screen.blit(font.render("Cevabı (İngilizce) yaz ve ENTER", True, (150, 150, 150)), (cx-150, cy + 80))
+
+            elif self.state == "FEEDBACK":
+                col = (50, 255, 50) if "DOĞRU" in self.feedback else (255, 50, 50)
+                fb = font.render(self.feedback, True, col)
+                self.screen.blit(fb, fb.get_rect(center=(cx, cy)))
+                if time.time() - feedback_start > 3.0:
+                    if self.round < self.total_rounds:
+                        self.round += 1
+                        self.state = "LOADING"
+                        self.start_round()
+                    else:
+                        end = font.render(f"Oyun Bitti! Skor: {self.score}", True, (255, 255, 0))
+                        self.screen.blit(end, end.get_rect(center=(cx, cy+100)))
+                        pygame.display.flip()
+                        pygame.time.wait(3000)
+                        return True
+
+            pygame.display.flip()
+            self.clock.tick(30)
+        return True
+
+# ============================================================================
+# MAIN
+# ============================================================================
+class GameManager:
+    def __init__(self):
+        pygame.init()
+        self.width, self.height = 1000, 700
+        self.screen = pygame.display.set_mode((self.width, self.height))
+        pygame.display.set_caption("NeuroFocus Local AI Hackathon")
+        self.clock = pygame.time.Clock()
+        self.running = True
+
+    def show_menu(self):
+        font = pygame.font.Font(None, 48)
+        btns = [
+            {"rect": pygame.Rect(300, 250, 400, 60), "text": "1. Uçak (Odak & Postür)", "id": "plane"},
+            {"rect": pygame.Rect(300, 350, 400, 60), "text": "2. Merdiven (Tırmanış)", "id": "stair"},
+            {"rect": pygame.Rect(300, 450, 400, 60), "text": "3. Hafıza (Local AI)", "id": "memory"}
+        ]
+        while self.running:
+            mx, my = pygame.mouse.get_pos()
+            click = False
+            for e in pygame.event.get():
+                if e.type == pygame.QUIT: return None
+                if e.type == pygame.MOUSEBUTTONDOWN: click = True
+                if e.type == pygame.KEYDOWN:
+                    if e.key == pygame.K_1: return "plane"
+                    if e.key == pygame.K_2: return "stair"
+                    if e.key == pygame.K_3: return "memory"
+                    if e.key == pygame.K_ESCAPE: return None
+            self.screen.fill((20, 30, 40))
+            title = pygame.font.Font(None, 64).render("NEUROFOCUS (LOCAL AI)", True, (255, 255, 255))
+            self.screen.blit(title, title.get_rect(center=(500, 150)))
+            for b in btns:
+                col = (70, 170, 70) if b["rect"].collidepoint(mx, my) else (50, 150, 50)
+                if click and b["rect"].collidepoint(mx, my): return b["id"]
+                pygame.draw.rect(self.screen, col, b["rect"], border_radius=10)
+                txt = font.render(b["text"], True, (255, 255, 255))
+                self.screen.blit(txt, txt.get_rect(center=b["rect"].center))
+            pygame.display.flip()
+            self.clock.tick(60)
+
+    def run(self):
+        while self.running:
+            sel = self.show_menu()
+            if not sel: break
+            game = None
+            if sel == "plane": game = PlaneGame(self.screen, self.width, self.height, self.clock)
+            elif sel == "stair": game = StairGame(self.screen, self.width, self.height, self.clock)
+            elif sel == "memory": game = MemoryGame(self.screen, self.width, self.height, self.clock)
+            if game: game.run()
+        pygame.quit()
+        if 'cv2' in sys.modules: cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    GameManager().run()
