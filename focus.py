@@ -5,32 +5,42 @@ import pygame
 import math
 from collections import deque
 import time
+import os
+import random
+import requests
+from difflib import SequenceMatcher
 
-# MediaPipe yüz tespiti için
+# --- HUGGING FACE ---
+import torch
+from PIL import Image
+from transformers import BlipProcessor, BlipForConditionalGeneration
+
+import sys
+
+def get_base_path():
+    """Exe olunca dosyanın olduğu yeri, normalde kodun olduğu yeri bulur"""
+    if getattr(sys, 'frozen', False):
+        # Exe olarak çalışıyorsa
+        return os.path.dirname(sys.executable)
+    else:
+        # Normal python dosyası olarak çalışıyorsa
+        return get_base_path()
+
+# MediaPipe Ayarları
 mp_face_mesh = mp.solutions.face_mesh
 mp_drawing = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles
 
-# EAR (Eye Aspect Ratio) hesaplama için kritik noktalar (MediaPipe Face Mesh)
-# Basitleştirilmiş EAR için kullanılacak noktalar
+# EAR Noktaları
 LEFT_EYE_TOP = 159
 LEFT_EYE_BOTTOM = 145
 LEFT_EYE_LEFT = 33
 LEFT_EYE_RIGHT = 133
-
 RIGHT_EYE_TOP = 386
 RIGHT_EYE_BOTTOM = 374
 RIGHT_EYE_LEFT = 362
 RIGHT_EYE_RIGHT = 263
 
-# Kafa pozisyonu için referans noktalar
-FACE_3D_POINTS = np.array([
-    [0.0, 0.0, 0.0],           # Burun ucu
-    [-225.0, 170.0, -135.0],   # Sol göz
-    [225.0, 170.0, -135.0],    # Sağ göz
-    [-150.0, -150.0, -125.0],  # Sol ağız köşesi
-    [150.0, -150.0, -125.0]    # Sağ ağız köşesi
-], dtype=np.float64)
 
 class AttentionTracker:
     def __init__(self):
@@ -40,361 +50,111 @@ class AttentionTracker:
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5
         )
-        
-        # Dikkat metrikleri için geçmiş veriler
-        self.eye_history = deque(maxlen=30)  # Son 30 frame
+        self.eye_history = deque(maxlen=30)
         self.head_pose_history = deque(maxlen=30)
-        self.attention_score = 1.0  # 0.0 (dağınık) - 1.0 (odaklı)
-        self.attention_history = deque(maxlen=10)  # Smoothing için
-        
-        # Kalibrasyon için
+        self.attention_score = 1.0
+        self.attention_history = deque(maxlen=10)
         self.calibrated = False
         self.base_eye_ratio = 0.25
         self.base_head_pose = np.array([0, 0, 0])
-        
+
     def calculate_ear(self, landmarks, top_idx, bottom_idx, left_idx, right_idx):
-        """Eye Aspect Ratio hesaplama - Basitleştirilmiş versiyon"""
         try:
-            if len(landmarks) < 468:
-                return 0.3
-            
-            # Gözün üst ve alt noktaları arasındaki mesafe (dikey)
-            vertical = np.linalg.norm(
-                np.array([landmarks[top_idx].x, landmarks[top_idx].y]) -
-                np.array([landmarks[bottom_idx].x, landmarks[bottom_idx].y])
-            )
-            
-            # Gözün sol ve sağ noktaları arasındaki mesafe (yatay)
-            horizontal = np.linalg.norm(
-                np.array([landmarks[left_idx].x, landmarks[left_idx].y]) -
-                np.array([landmarks[right_idx].x, landmarks[right_idx].y])
-            )
-            
-            if horizontal == 0:
-                return 0.3
-            
+            if len(landmarks) < 468: return 0.3
+            vertical = np.linalg.norm(np.array([landmarks[top_idx].x, landmarks[top_idx].y]) - np.array(
+                [landmarks[bottom_idx].x, landmarks[bottom_idx].y]))
+            horizontal = np.linalg.norm(np.array([landmarks[left_idx].x, landmarks[left_idx].y]) - np.array(
+                [landmarks[right_idx].x, landmarks[right_idx].y]))
+            if horizontal == 0: return 0.3
             ear = vertical / horizontal
             return max(0.0, min(1.0, ear))
-        except (IndexError, AttributeError) as e:
+        except:
             return 0.3
-    
+
     def calculate_head_pose(self, landmarks, image_shape):
-        """Kafa pozisyonu hesaplama - İyileştirilmiş versiyon"""
         try:
-            if len(landmarks) < 468:
-                return np.array([0, 0, 0])
-            
-            # Daha doğru landmark noktaları kullan
-            # MediaPipe Face Mesh'te daha stabil noktalar
+            if len(landmarks) < 468: return np.array([0, 0, 0])
             image_points = np.array([
-                [landmarks[1].x * image_shape[1], landmarks[1].y * image_shape[0]],   # Burun kökü (daha stabil)
-                [landmarks[33].x * image_shape[1], landmarks[33].y * image_shape[0]],  # Sol göz dış köşe
-                [landmarks[263].x * image_shape[1], landmarks[263].y * image_shape[0]],  # Sağ göz dış köşe
-                [landmarks[61].x * image_shape[1], landmarks[61].y * image_shape[0]],  # Sol ağız köşesi
-                [landmarks[291].x * image_shape[1], landmarks[291].y * image_shape[0]],  # Sağ ağız köşesi
-                [landmarks[4].x * image_shape[1], landmarks[4].y * image_shape[0]]   # Burun ucu
+                [landmarks[1].x * image_shape[1], landmarks[1].y * image_shape[0]],
+                [landmarks[33].x * image_shape[1], landmarks[33].y * image_shape[0]],
+                [landmarks[263].x * image_shape[1], landmarks[263].y * image_shape[0]],
+                [landmarks[61].x * image_shape[1], landmarks[61].y * image_shape[0]],
+                [landmarks[291].x * image_shape[1], landmarks[291].y * image_shape[0]],
+                [landmarks[4].x * image_shape[1], landmarks[4].y * image_shape[0]]
             ], dtype=np.float64)
-            
-            # 3D model noktaları (güncellenmiş)
             model_points = np.array([
-                [0.0, 0.0, 0.0],           # Burun kökü
-                [-225.0, 170.0, -135.0],   # Sol göz
-                [225.0, 170.0, -135.0],    # Sağ göz
-                [-150.0, -150.0, -125.0],  # Sol ağız köşesi
-                [150.0, -150.0, -125.0],   # Sağ ağız köşesi
-                [0.0, -330.0, -65.0]       # Burun ucu
+                [0.0, 0.0, 0.0], [-225.0, 170.0, -135.0], [225.0, 170.0, -135.0],
+                [-150.0, -150.0, -125.0], [150.0, -150.0, -125.0], [0.0, -330.0, -65.0]
             ], dtype=np.float64)
-            
-            # Kamera parametreleri (tahmini)
             focal_length = image_shape[1]
             center = (image_shape[1] / 2, image_shape[0] / 2)
-            camera_matrix = np.array([
-                [focal_length, 0, center[0]],
-                [0, focal_length, center[1]],
-                [0, 0, 1]
-            ], dtype=np.float64)
-            
+            camera_matrix = np.array([[focal_length, 0, center[0]], [0, focal_length, center[1]], [0, 0, 1]],
+                                     dtype=np.float64)
             dist_coeffs = np.zeros((4, 1))
-            
-            # SolvePnP ile kafa pozisyonu
-            success, rotation_vector, translation_vector = cv2.solvePnP(
-                model_points, image_points, camera_matrix, dist_coeffs, 
-                flags=cv2.SOLVEPNP_ITERATIVE
-            )
-            
+            success, rotation_vector, translation_vector = cv2.solvePnP(model_points, image_points, camera_matrix,
+                                                                        dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE)
             if success:
-                # Euler açılarına dönüştür
                 rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
-                
-                # Doğru Euler açıları hesaplama
-                sy = np.sqrt(rotation_matrix[0, 0] * rotation_matrix[0, 0] + rotation_matrix[1, 0] * rotation_matrix[1, 0])
-                singular = sy < 1e-6
-                
-                if not singular:
-                    x = np.arctan2(rotation_matrix[2, 1], rotation_matrix[2, 2]) * 180 / np.pi  # Roll
-                    y = np.arctan2(-rotation_matrix[2, 0], sy) * 180 / np.pi  # Pitch
-                    z = np.arctan2(rotation_matrix[1, 0], rotation_matrix[0, 0]) * 180 / np.pi  # Yaw
-                else:
+                sy = np.sqrt(
+                    rotation_matrix[0, 0] * rotation_matrix[0, 0] + rotation_matrix[1, 0] * rotation_matrix[1, 0])
+                if sy < 1e-6:
                     x = np.arctan2(-rotation_matrix[1, 2], rotation_matrix[1, 1]) * 180 / np.pi
                     y = np.arctan2(-rotation_matrix[2, 0], sy) * 180 / np.pi
                     z = 0
-                
-                angles = np.array([y, z, x])  # Pitch, Yaw, Roll sırası
-                return angles
-            
+                else:
+                    x = np.arctan2(rotation_matrix[2, 1], rotation_matrix[2, 2]) * 180 / np.pi
+                    y = np.arctan2(-rotation_matrix[2, 0], sy) * 180 / np.pi
+                    z = np.arctan2(rotation_matrix[1, 0], rotation_matrix[0, 0]) * 180 / np.pi
+                return np.array([y, z, x])
             return np.array([0, 0, 0])
-        except (IndexError, AttributeError, cv2.error) as e:
+        except:
             return np.array([0, 0, 0])
-    
+
     def process_frame(self, frame):
-        """Frame'i işle ve dikkat skorunu hesapla"""
         try:
-            if frame is None or frame.size == 0:
-                return self.attention_score, None, None
-                
+            if frame is None or frame.size == 0: return self.attention_score, None, None
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = self.face_mesh.process(rgb_frame)
-            
-            # Yüz tespit edilemediyse dikkat dağınık say (ama çok agresif değil)
             if not results.multi_face_landmarks:
-                if self.calibrated:
-                    # Yüz görünmüyorsa (başka yöne çevrilmiş olabilir) dikkat skorunu yavaşça düşür
-                    self.attention_score = max(0.0, self.attention_score - 0.05)
+                if self.calibrated: self.attention_score = max(0.0, self.attention_score - 0.05)
                 return self.attention_score, None, None
-            
-            if results.multi_face_landmarks:
-                landmarks = results.multi_face_landmarks[0].landmark
-                
-                # Göz açıklığı hesaplama
-                left_ear = self.calculate_ear(landmarks, LEFT_EYE_TOP, LEFT_EYE_BOTTOM, LEFT_EYE_LEFT, LEFT_EYE_RIGHT)
-                right_ear = self.calculate_ear(landmarks, RIGHT_EYE_TOP, RIGHT_EYE_BOTTOM, RIGHT_EYE_LEFT, RIGHT_EYE_RIGHT)
-                avg_ear = (left_ear + right_ear) / 2.0
-                
-                # Kafa pozisyonu
-                head_pose = self.calculate_head_pose(landmarks, frame.shape)
-                
-                # Kalibrasyon (ilk birkaç frame)
-                if not self.calibrated:
-                    self.eye_history.append(avg_ear)
-                    self.head_pose_history.append(head_pose.copy())
-                    
-                    if len(self.eye_history) >= 30:
-                        self.base_eye_ratio = np.mean(self.eye_history)
-                        self.base_head_pose = np.mean(self.head_pose_history, axis=0)
-                        self.calibrated = True
+            landmarks = results.multi_face_landmarks[0].landmark
+            left_ear = self.calculate_ear(landmarks, LEFT_EYE_TOP, LEFT_EYE_BOTTOM, LEFT_EYE_LEFT, LEFT_EYE_RIGHT)
+            right_ear = self.calculate_ear(landmarks, RIGHT_EYE_TOP, RIGHT_EYE_BOTTOM, RIGHT_EYE_LEFT, RIGHT_EYE_RIGHT)
+            avg_ear = (left_ear + right_ear) / 2.0
+            head_pose = self.calculate_head_pose(landmarks, frame.shape)
+            if not self.calibrated:
+                self.eye_history.append(avg_ear)
+                self.head_pose_history.append(head_pose.copy())
+                if len(self.eye_history) >= 30:
+                    self.base_eye_ratio = np.mean(self.eye_history)
+                    self.base_head_pose = np.mean(self.head_pose_history, axis=0)
+                    self.calibrated = True
+            else:
+                eye_ratio = avg_ear / self.base_eye_ratio if self.base_eye_ratio > 0 else 1.0
+                eye_score = 1.0
+                if eye_ratio < 0.7: eye_score = max(0.0, eye_ratio / 0.25) * 0.1
+
+                yaw_diff = abs(head_pose[1] - self.base_head_pose[1])
+                yaw_score = 1.0
+                if yaw_diff > 8: yaw_score = max(0.0, 0.1 - (yaw_diff - 25) * 0.01)
+
+                head_score = yaw_score
+                raw_score = (eye_score * 0.65 + head_score * 0.35)
+                self.attention_history.append(raw_score)
+                if len(self.attention_history) >= 3:
+                    self.attention_score = sum(self.attention_history) / len(self.attention_history)
                 else:
-                    # Dikkat skoru hesaplama - Dengeli ve hassas versiyon
-                    # Göz açıklığı kontrolü (gözler kapanıyorsa dikkat dağınık)
-                    eye_ratio = avg_ear / self.base_eye_ratio if self.base_eye_ratio > 0 else 1.0
-                    
-                    # Göz skoru - göz kapalıyken agresif ceza
-                    # Gözler kapalıyken (eye_ratio < 0.5) çok düşük puan
-                    if eye_ratio >= 0.70:
-                        eye_score = 1.0  # Tam açık
-                    elif eye_ratio >= 0.60:
-                        # 0.60-0.70 arası: 0.9'dan 1.0'a geçiş
-                        eye_score = 0.9 + (eye_ratio - 0.60) * 1.0
-                    elif eye_ratio >= 0.50:
-                        # 0.50-0.60 arası: 0.7'den 0.9'a geçiş
-                        eye_score = 0.7 + (eye_ratio - 0.50) * 2.0
-                    elif eye_ratio >= 0.40:
-                        # 0.40-0.50 arası: 0.4'den 0.7'ye geçiş (yarı açık)
-                        eye_score = 0.4 + (eye_ratio - 0.40) * 3.0
-                    elif eye_ratio >= 0.25:
-                        # 0.25-0.40 arası: 0.1'den 0.4'e geçiş (kısmen kapalı)
-                        eye_score = 0.1 + (eye_ratio - 0.25) * 2.0
-                    else:
-                        # %25'den az: çok düşük puan (kapalı)
-                        eye_score = max(0.0, eye_ratio / 0.25) * 0.1
-                    
-                    # Kafa hareketi kontrolü - Yaw (sağa-sola) öncelikli
-                    yaw_diff = abs(head_pose[1] - self.base_head_pose[1])  # Yaw en önemli
-                    pitch_diff = abs(head_pose[0] - self.base_head_pose[0])
-                    roll_diff = abs(head_pose[2] - self.base_head_pose[2])
-                    
-                    # Yaw (sağa-sola dönüş) için hassas kontrol - 8 dereceden itibaren ceza
-                    if yaw_diff <= 8:
-                        yaw_score = 1.0
-                    elif yaw_diff <= 15:
-                        # 8-15 arası: yumuşak düşüş
-                        yaw_score = 1.0 - (yaw_diff - 8) * 0.1
-                    elif yaw_diff <= 25:
-                        # 15-25 arası: orta düşüş
-                        yaw_score = 0.3 - (yaw_diff - 15) * 0.02
-                    else:
-                        # 25+ derece: çok düşük puan
-                        yaw_score = max(0.0, 0.1 - (yaw_diff - 25) * 0.01)
-                    
-                    # Pitch (yukarı-aşağı) kontrolü - 12 dereceden itibaren ceza
-                    if pitch_diff <= 12:
-                        pitch_score = 1.0
-                    elif pitch_diff <= 20:
-                        pitch_score = 1.0 - (pitch_diff - 12) * 0.1
-                    else:
-                        pitch_score = max(0.0, 0.2 - (pitch_diff - 20) * 0.02)
-                    
-                    # Roll (eğilme) kontrolü - daha toleranslı
-                    if roll_diff <= 15:
-                        roll_score = 1.0
-                    else:
-                        roll_score = max(0.0, 1.0 - (roll_diff - 15) * 0.05)
-                    
-                    # Kafa skoru - Yaw'a çok daha fazla ağırlık ver
-                    head_score = (yaw_score * 0.6 + pitch_score * 0.25 + roll_score * 0.15)
-                    
-                    # Genel dikkat skoru - göz daha ağırlıklı (göz kapalıyken kesin düşsün)
-                    raw_score = (eye_score * 0.65 + head_score * 0.35)
-                    
-                    # Kalibrasyon sonrası ilk birkaç frame için minimum skor garantisi
-                    # Ama göz kapalıyken (eye_score < 0.3) garantiyi uygulama
-                    frames_since_calibration = len(self.eye_history) - 30 if len(self.eye_history) > 30 else 0
-                    if frames_since_calibration < 30 and eye_score >= 0.3:  # İlk 1 saniye ve göz açıksa
-                        # İlk saniyede minimum 0.75 skor garantisi (sadece göz açıksa)
-                        raw_score = max(raw_score, 0.75)
-                    
-                    # Smoothing - ani değişiklikleri yumuşat (daha agresif smoothing)
-                    self.attention_history.append(raw_score)
-                    if len(self.attention_history) >= 3:
-                        # Son 8 frame'in ağırlıklı ortalaması (son frame'ler daha önemli)
-                        recent_scores = list(self.attention_history)[-8:]
-                        weights = [0.5, 0.7, 0.9, 1.0, 1.0, 1.0, 1.0, 1.0][-len(recent_scores):]
-                        weighted_sum = sum(s * w for s, w in zip(recent_scores, weights))
-                        weight_sum = sum(weights)
-                        self.attention_score = weighted_sum / weight_sum
-                    else:
-                        self.attention_score = raw_score
-                    
-                    self.attention_score = max(0.0, min(1.0, self.attention_score))
-                    
-                    # Geçmişe ekle
-                    self.eye_history.append(avg_ear)
-                    self.head_pose_history.append(head_pose.copy())
-            
-            # Burun ucu pozisyonunu döndür (görselleştirme için)
-            nose_tip = None
-            if results.multi_face_landmarks:
-                landmarks = results.multi_face_landmarks[0].landmark
-                nose_tip = (landmarks[4].x, landmarks[4].y)  # Burun ucu landmark'ı
-            
+                    self.attention_score = raw_score
+                self.attention_score = max(0.0, min(1.0, self.attention_score))
+
+            nose_tip = (landmarks[4].x, landmarks[4].y) if results.multi_face_landmarks else None
             return self.attention_score, results.multi_face_landmarks, nose_tip
-        except Exception as e:
-            print(f"Frame işleme hatası: {e}")
-            return self.attention_score, None
+        except:
+            return self.attention_score, None, None
 
 
-class GameManager:
-    """Ana oyun yöneticisi - menü ve oyun seçimi"""
-    def __init__(self):
-        pygame.init()
-        self.width = 800
-        self.height = 600
-        self.screen = pygame.display.set_mode((self.width, self.height))
-        pygame.display.set_caption("Focus Game - Dikkat Takibi")
-        self.clock = pygame.time.Clock()
-        self.running = True
-        self.bg_color = (20, 30, 40)
-        
-    def show_main_menu(self):
-        """Ana menü - oyun seçimi"""
-        title_font = pygame.font.Font(None, 64)
-        button_font = pygame.font.Font(None, 48)
-        info_font = pygame.font.Font(None, 24)
-        
-        plane_button_rect = pygame.Rect(self.width // 2 - 150, self.height // 2 - 50, 300, 60)
-        circle_button_rect = pygame.Rect(self.width // 2 - 150, self.height // 2 + 30, 300, 60)
-        button_color = (50, 150, 50)
-        button_hover_color = (70, 170, 70)
-        
-        selected_game = None
-        
-        while selected_game is None and self.running:
-            mouse_pos = pygame.mouse.get_pos()
-            mouse_clicked = False
-            
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    self.running = False
-                    return None
-                elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_ESCAPE:
-                        self.running = False
-                        return None
-                    elif event.key == pygame.K_1:
-                        selected_game = "plane"
-                    elif event.key == pygame.K_2:
-                        selected_game = "circle"
-                elif event.type == pygame.MOUSEBUTTONDOWN:
-                    if event.button == 1:
-                        mouse_clicked = True
-            
-            # Buton hover efektleri
-            plane_color = button_hover_color if plane_button_rect.collidepoint(mouse_pos) else button_color
-            circle_color = button_hover_color if circle_button_rect.collidepoint(mouse_pos) else button_color
-            
-            # Buton tıklamaları
-            if mouse_clicked:
-                if plane_button_rect.collidepoint(mouse_pos):
-                    selected_game = "plane"
-                elif circle_button_rect.collidepoint(mouse_pos):
-                    selected_game = "circle"
-            
-            # Ekranı temizle
-            self.screen.fill(self.bg_color)
-            
-            # Başlık
-            title_text = title_font.render("FOCUS GAME", True, (255, 255, 255))
-            title_rect = title_text.get_rect(center=(self.width // 2, 100))
-            self.screen.blit(title_text, title_rect)
-            
-            # Alt başlık
-            subtitle_text = info_font.render("Oyun Seçin", True, (200, 200, 200))
-            subtitle_rect = subtitle_text.get_rect(center=(self.width // 2, 150))
-            self.screen.blit(subtitle_text, subtitle_rect)
-            
-            # Uçak Oyunu butonu
-            pygame.draw.rect(self.screen, plane_color, plane_button_rect, border_radius=10)
-            pygame.draw.rect(self.screen, (255, 255, 255), plane_button_rect, width=2, border_radius=10)
-            plane_text = button_font.render("1. Uçak Oyunu", True, (255, 255, 255))
-            plane_text_rect = plane_text.get_rect(center=plane_button_rect.center)
-            self.screen.blit(plane_text, plane_text_rect)
-            
-            # Daire Oyunu butonu
-            pygame.draw.rect(self.screen, circle_color, circle_button_rect, border_radius=10)
-            pygame.draw.rect(self.screen, (255, 255, 255), circle_button_rect, width=2, border_radius=10)
-            circle_text = button_font.render("2. Daire Oyunu", True, (255, 255, 255))
-            circle_text_rect = circle_text.get_rect(center=circle_button_rect.center)
-            self.screen.blit(circle_text, circle_text_rect)
-            
-            # Talimatlar
-            inst_text = info_font.render("ESC ile çıkış | Geri tuşu ile menüye dönüş", True, (150, 150, 150))
-            inst_rect = inst_text.get_rect(center=(self.width // 2, self.height - 30))
-            self.screen.blit(inst_text, inst_rect)
-            
-            pygame.display.flip()
-            self.clock.tick(60)
-        
-        return selected_game
-    
-    def run(self):
-        """Ana döngü"""
-        while self.running:
-            selected = self.show_main_menu()
-            if not self.running or selected is None:
-                break
-            
-            if selected == "plane":
-                plane_game = PlaneGame(self.screen, self.width, self.height, self.clock)
-                if not plane_game.run():
-                    continue  # Menüye dön
-            elif selected == "circle":
-                circle_game = CircleGame(self.screen, self.width, self.height, self.clock)
-                if not circle_game.run():
-                    continue  # Menüye dön
-        
-        pygame.quit()
-        cv2.destroyAllWindows()
-        print("Uygulama kapatıldı.")
-
+# ----------------- OYUN SINIFLARI -----------------
 
 class PlaneGame:
     def __init__(self, screen, width, height, clock):
@@ -402,428 +162,463 @@ class PlaneGame:
         self.width = width
         self.height = height
         self.clock = clock
-        
-        # Uçak pozisyonu
         self.plane_x = self.width // 2
         self.plane_y = self.height // 2
         self.plane_velocity = 0
         self.max_velocity = 5
-        
-        # Oyun durumu
         self.running = True
         self.attention_tracker = AttentionTracker()
         self.cap = None
-        
-        # Renkler
         self.bg_color = (20, 30, 40)
-        self.plane_color = (100, 200, 255)
-        self.cloud_color = (200, 200, 200)
-        
-        # Bulutlar
-        self.clouds = []
-        for i in range(5):
-            self.clouds.append({
-                'x': np.random.randint(0, self.width),
-                'y': np.random.randint(0, self.height),
-                'size': np.random.randint(30, 60)
-            })
-    
-    def init_camera(self):
-        """Kamerayı başlat"""
-        self.cap = cv2.VideoCapture(0)
-        if not self.cap.isOpened():
-            print("Kamera açılamadı!")
-            return False
-        return True
-    
-    def draw_plane(self, x, y, angle):
-        """Uçağı çiz - Güzel ve detaylı versiyon"""
-        # Uçak gövdesi (ana gövde)
-        body_points = [
-            (x, y - 20),      # Burun
-            (x - 8, y - 5),   # Sol üst
-            (x - 12, y + 8),  # Sol alt
-            (x - 8, y + 15),  # Sol kanat alt
-            (x, y + 12),      # Alt merkez
-            (x + 8, y + 15),  # Sağ kanat alt
-            (x + 12, y + 8),  # Sağ alt
-            (x + 8, y - 5)    # Sağ üst
-        ]
-        pygame.draw.polygon(self.screen, (120, 180, 220), body_points)
-        pygame.draw.polygon(self.screen, (80, 150, 200), body_points, width=2)
-        
-        # Kanatlar (yan kanatlar)
-        left_wing = [
-            (x - 12, y + 2),
-            (x - 20, y + 5),
-            (x - 18, y + 8),
-            (x - 12, y + 8)
-        ]
-        right_wing = [
-            (x + 12, y + 2),
-            (x + 20, y + 5),
-            (x + 18, y + 8),
-            (x + 12, y + 8)
-        ]
-        pygame.draw.polygon(self.screen, (100, 160, 240), left_wing)
-        pygame.draw.polygon(self.screen, (100, 160, 240), right_wing)
-        
-        # Kuyruk
-        tail = [
-            (x, y + 12),
-            (x - 4, y + 18),
-            (x, y + 20),
-            (x + 4, y + 18)
-        ]
-        pygame.draw.polygon(self.screen, (90, 140, 190), tail)
-        
-        # Kokpit (cam)
-        pygame.draw.circle(self.screen, (150, 200, 255), (x, y - 8), 5)
-        pygame.draw.circle(self.screen, (200, 230, 255), (x, y - 8), 3)
-        
-        # Motor/egzoz (arka)
-        pygame.draw.ellipse(self.screen, (60, 100, 150), (x - 3, y + 10, 6, 4))
-        
-        # Detay çizgileri
-        pygame.draw.line(self.screen, (70, 120, 170), (x - 8, y - 2), (x + 8, y - 2), 1)
-        pygame.draw.line(self.screen, (70, 120, 170), (x - 10, y + 5), (x + 10, y + 5), 1)
-    
-    def draw_clouds(self):
-        """Bulutları çiz"""
-        for cloud in self.clouds:
-            pygame.draw.circle(self.screen, self.cloud_color, 
-                            (cloud['x'], cloud['y']), cloud['size'])
-            pygame.draw.circle(self.screen, self.cloud_color, 
-                            (cloud['x'] + 20, cloud['y']), cloud['size'] - 10)
-            pygame.draw.circle(self.screen, self.cloud_color, 
-                            (cloud['x'] - 20, cloud['y']), cloud['size'] - 10)
-    
-    def update_clouds(self):
-        """Bulutları hareket ettir"""
-        for cloud in self.clouds:
-            cloud['x'] -= 1
-            if cloud['x'] < -100:
-                cloud['x'] = self.width + 100
-                cloud['y'] = np.random.randint(0, self.height)
-    
-    def run(self):
-        """Ana oyun döngüsü"""
-        try:
-            if not self.init_camera():
-                return False
-            
-            font = pygame.font.Font(None, 36)
-            small_font = pygame.font.Font(None, 24)
-            
-            self.plane_y = self.height // 2
-            self.plane_velocity = 0
-            self.attention_tracker = AttentionTracker()
-            
-            # --- YENİ AYARLAR: GÜVENLİ KUTU ---
-            CEILING_LIMIT = 100 
-            
-            # Kutu Boyutları
-            SAFE_ZONE_WIDTH = 200   # Genişlik
-            SAFE_ZONE_HEIGHT = 400  # Yükseklik (Dikey alan)
-            
-            # Kutunun Koordinatlarını Hesapla (Ekranın tam ortası)
-            # Örn: 800x600 ekranda -> X: 300-500 arası, Y: 100-500 arası
-            safe_zone_left = (self.width - SAFE_ZONE_WIDTH) // 2
-            safe_zone_right = safe_zone_left + SAFE_ZONE_WIDTH
-            
-            safe_zone_top = (self.height - SAFE_ZONE_HEIGHT) // 2
-            safe_zone_bottom = safe_zone_top + SAFE_ZONE_HEIGHT
-            
-            while self.running:
-                try:
-                    for event in pygame.event.get():
-                        if event.type == pygame.QUIT:
-                            return False
-                        elif event.type == pygame.KEYDOWN:
-                            if event.key == pygame.K_ESCAPE:
-                                return False
-                            elif event.key == pygame.K_BACKSPACE:
-                                return True
-                    
-                    ret, frame = self.cap.read()
-                    if not ret: continue
-                    
-                    attention_score, face_landmarks, nose_tip = self.attention_tracker.process_frame(frame)
-                    
-                    # --- GÜVENLİ KUTU KONTROLÜ (Hem Yatay Hem Dikey) ---
-                    is_in_safe_zone = True
-                    
-                    if nose_tip is not None:
-                        nose_x = int(nose_tip[0] * self.width)
-                        nose_y = int(nose_tip[1] * self.height)
-                        
-                        # Kutu dışına çıktı mı?
-                        # Sol-Sağ VEYA Yukarı-Aşağı sınır ihlali var mı?
-                        if (nose_x < safe_zone_left or nose_x > safe_zone_right or 
-                            nose_y < safe_zone_top or nose_y > safe_zone_bottom):
-                            
-                            is_in_safe_zone = False
-                            # Cezalandır
-                            attention_score -= 0.5 
-                            attention_score = max(0.0, attention_score)
-                    
-                    # Uçak hareketi
-                    if attention_score > 0.7:
-                        self.plane_velocity = max(-self.max_velocity, self.plane_velocity - 0.2)
-                    else:
-                        self.plane_velocity = min(self.max_velocity, self.plane_velocity + 0.3)
-                    
-                    self.plane_y += self.plane_velocity
-                    
-                    if self.plane_y < CEILING_LIMIT:
-                        self.plane_y = CEILING_LIMIT
-                    elif self.plane_y > self.height:
-                        self.plane_y = self.height
-                    
-                    # --- ÇİZİM ---
-                    self.screen.fill(self.bg_color)
-                    
-                    # Güvenli Kutuyu Çiz (Kullanıcı sınırlarını görsün)
-                    # Gri renkte, içi boş bir dikdörtgen
-                    box_color = (50, 60, 70)
-                    pygame.draw.rect(self.screen, box_color, 
-                                   (safe_zone_left, safe_zone_top, SAFE_ZONE_WIDTH, SAFE_ZONE_HEIGHT), 2)
-                    
-                    self.draw_clouds()
-                    self.update_clouds()
-                    
-                    angle = -self.plane_velocity * 5
-                    self.draw_plane(self.plane_x, int(self.plane_y), angle)
-                    
-                    # Skor
-                    attention_text = f"Dikkat: {attention_score:.2f}"
-                    color = (0, 255, 0) if attention_score > 0.7 else (255, 0, 0)
-                    text_surface = font.render(attention_text, True, color)
-                    self.screen.blit(text_surface, (10, 10))
-                    
-                    if not self.attention_tracker.calibrated:
-                        calib_text = small_font.render("Kalibrasyon yapılıyor...", True, (255, 255, 255))
-                        self.screen.blit(calib_text, (10, 50))
-                    
-                    back_text = small_font.render("Geri: Backspace | Çıkış: ESC", True, (150, 150, 150))
-                    self.screen.blit(back_text, (10, self.height - 30))
-                    
-                    # --- BURUN POINTER & UYARI ---
-                    if nose_tip is not None and self.attention_tracker.calibrated:
-                        pointer_color = (0, 255, 255) if is_in_safe_zone else (255, 0, 0)
-                        
-                        pygame.draw.circle(self.screen, pointer_color, (nose_x, nose_y), 8, 2)
-                        pygame.draw.circle(self.screen, pointer_color, (nose_x, nose_y), 3)
-                        
-                        if not is_in_safe_zone:
-                            # Hangi yöne gitmesi gerektiğini söyleyelim
-                            msg = "MERKEZE DON!"
-                            if nose_y < safe_zone_top: msg = "ASAGI BAK!"
-                            elif nose_y > safe_zone_bottom: msg = "YUKARI BAK!"
-                            
-                            warn_text = small_font.render(msg, True, (255, 50, 50))
-                            self.screen.blit(warn_text, (nose_x - 40, nose_y - 30))
+        self.clouds = [
+            {'x': np.random.randint(0, width), 'y': np.random.randint(0, height), 'size': np.random.randint(30, 60)} for
+            _ in range(5)]
 
-                    if face_landmarks is None:
-                        no_face_text = small_font.render("Yüz Bulunamadı", True, (255, 200, 0))
-                        self.screen.blit(no_face_text, (10, 80))
-                    
-                    if self.plane_y >= self.height - 20:
-                        game_over_text = font.render("Dikkat Dağınık! Oyun Bitti", True, (255, 0, 0))
-                        text_rect = game_over_text.get_rect(center=(self.width // 2, self.height // 2))
-                        self.screen.blit(game_over_text, text_rect)
-                    
-                    pygame.display.flip()
-                    self.clock.tick(30)
-                    
-                except Exception as e:
-                    print(f"Hata: {e}")
-                    return False
-        
-        except Exception as e:
-            print(f"Kritik Hata: {e}")
-            return False
-        finally:
-            if self.cap: self.cap.release()
+    def init_camera(self):
+        self.cap = cv2.VideoCapture(0)
+        return self.cap.isOpened()
+
+    def draw_plane(self, x, y, angle):
+        body_points = [(x, y - 20), (x - 8, y - 5), (x - 12, y + 8), (x, y + 12), (x + 12, y + 8), (x + 8, y - 5)]
+        pygame.draw.polygon(self.screen, (120, 180, 220), body_points)
+        pygame.draw.polygon(self.screen, (100, 160, 240), [(x - 12, y + 2), (x - 20, y + 5), (x - 12, y + 8)])
+        pygame.draw.polygon(self.screen, (100, 160, 240), [(x + 12, y + 2), (x + 20, y + 5), (x + 12, y + 8)])
+
+    def run(self):
+        if not self.init_camera(): return False
+        font = pygame.font.Font(None, 36)
+        small_font = pygame.font.Font(None, 24)
+
+        SAFE_ZONE_WIDTH = 200
+        SAFE_ZONE_HEIGHT = 400
+        safe_zone_left = (self.width - SAFE_ZONE_WIDTH) // 2
+        safe_zone_right = safe_zone_left + SAFE_ZONE_WIDTH
+        safe_zone_top = (self.height - SAFE_ZONE_HEIGHT) // 2
+        safe_zone_bottom = safe_zone_top + SAFE_ZONE_HEIGHT
+
+        # 5 dakika süre sınırı
+        game_duration = 300  # 5 dakika = 300 saniye
+        start_time = time.time()
+        game_completed = False
+
+        while self.running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT: return False
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE: return False
+                    if event.key == pygame.K_BACKSPACE:
+                        self.cap.release()
+                        return True
+
+            ret, frame = self.cap.read()
+            if not ret: continue
+
+            # Süre kontrolü
+            elapsed_time = time.time() - start_time
+            remaining_time = max(0, game_duration - elapsed_time)
+
+            if remaining_time <= 0 and not game_completed:
+                game_completed = True
+
+            attention_score, landmarks, nose_tip = self.attention_tracker.process_frame(frame)
+
+            # Safe zone kontrolü
+            is_in_safe_zone = False
+            if nose_tip:
+                nx, ny = int(nose_tip[0] * self.width), int(nose_tip[1] * self.height)
+                if (safe_zone_left <= nx <= safe_zone_right and
+                        safe_zone_top <= ny <= safe_zone_bottom):
+                    is_in_safe_zone = True
+
+            # Oyun mantığı sadece süre dolmadıysa çalışsın
+            if not game_completed:
+                # YENİ MANTIK: Burun ucu safe zone içindeyse uçak yükselsin, dışındayken alçalsın
+                if is_in_safe_zone:
+                    # Safe zone içinde: uçak yükselsin (velocity azalsın, yukarı gitsin)
+                    self.plane_velocity = max(-self.max_velocity, self.plane_velocity - 0.2)
+                else:
+                    # Safe zone dışında: uçak alçalsın (velocity artsın, aşağı gitsin)
+                    self.plane_velocity = min(self.max_velocity, self.plane_velocity + 0.3)
+
+                # Uçağın pozisyonunu güncelle
+                self.plane_y = max(100, min(self.height, self.plane_y + self.plane_velocity))
+
+            self.screen.fill(self.bg_color)
+            pygame.draw.rect(self.screen, (50, 60, 70),
+                             (safe_zone_left, safe_zone_top, SAFE_ZONE_WIDTH, SAFE_ZONE_HEIGHT), 2)
+
+            for c in self.clouds:
+                c['x'] -= 1
+                if c['x'] < -100: c['x'], c['y'] = self.width + 100, np.random.randint(0, self.height)
+                pygame.draw.circle(self.screen, (200, 200, 200), (c['x'], c['y']), c['size'])
+
+            self.draw_plane(self.plane_x, int(self.plane_y), -self.plane_velocity * 5)
+
+            # Kalan süreyi göster
+            minutes = int(remaining_time // 60)
+            seconds = int(remaining_time % 60)
+            time_text = font.render(f"Kalan Sure: {minutes:02d}:{seconds:02d}", True, (255, 255, 0))
+            self.screen.blit(time_text, (10, 50))
+
+            if nose_tip and self.attention_tracker.calibrated and not game_completed:
+                nx, ny = int(nose_tip[0] * self.width), int(nose_tip[1] * self.height)
+                col = (0, 255, 255) if is_in_safe_zone else (255, 0, 0)
+                pygame.draw.circle(self.screen, col, (nx, ny), 8, 2)
+                if not is_in_safe_zone:
+                    msg = "MERKEZE DON!"
+                    if ny < safe_zone_top:
+                        msg = "ASAGI BAK!"
+                    elif ny > safe_zone_bottom:
+                        msg = "YUKARI BAK!"
+                    self.screen.blit(small_font.render(msg, True, (255, 50, 50)), (nx - 40, ny - 30))
+
+            if game_completed:
+                self.screen.blit(font.render("OYUN TAMAMLANDI", True, (0, 255, 0)),
+                                 (self.width // 2 - 120, self.height // 2))
+            elif self.plane_y >= self.height - 20:
+                self.screen.blit(font.render("OYUN BITTI", True, (255, 0, 0)), (self.width // 2 - 70, self.height // 2))
+
+            pygame.display.flip()
+            self.clock.tick(30)
+
+        if self.cap: self.cap.release()
         return False
 
 
-class CircleGame:
-    """Daire oyunu - ikişer atladığında boşluk tuşuna bas"""
+class ImageDescriptionGame:
     def __init__(self, screen, width, height, clock):
         self.screen = screen
         self.width = width
         self.height = height
         self.clock = clock
-        
-        # Oyun durumu
+        self.running = True
+
+        # Bekleme Ekranı
+        self.screen.fill((20, 30, 40))
+        font = pygame.font.Font(None, 36)
+        txt = font.render("AI Modeli Yukleniyor... Lutfen Bekleyin", True, (255, 255, 255))
+        self.screen.blit(txt, (width // 2 - 250, height // 2))
+        pygame.display.flip()
+
+        print("Model yükleniyor...")
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+        self.model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to(
+            self.device)
+
+        # --- RESİM LİSTESİ HAZIRLIĞI ---
+        script_dir = get_base_path()
+        self.photo_folder = os.path.join(script_dir, "fotograflar")
+        if not os.path.exists(self.photo_folder):
+            os.makedirs(self.photo_folder)
+
+        # Klasördeki resimleri bul
+        valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp')
+        self.available_images = [f for f in os.listdir(self.photo_folder) if f.lower().endswith(valid_extensions)]
+
+        # Eğer klasör boşsa yedek indir
+        if not self.available_images:
+            print("Klasör boş, örnek resim indiriliyor...")
+            backup_path = os.path.join(self.photo_folder, "ornek_resim.jpg")
+            try:
+                headers = {'User-Agent': 'Mozilla/5.0'}
+                img_url = "https://picsum.photos/600/400"
+                response = requests.get(img_url, headers=headers, timeout=10)
+                if response.status_code == 200:
+                    with open(backup_path, 'wb') as f:
+                        f.write(response.content)
+                    self.available_images.append("ornek_resim.jpg")
+            except Exception as e:
+                print(f"İndirme hatası: {e}")
+
+        # OYUN AYARLARI
+        self.MAX_ROUNDS = 5
+        self.current_round = 0
+        self.total_score = 0
+        self.round_history = []
+
+        # Resim sırasını karıştır
+        if len(self.available_images) > 0:
+            # Her round için 3 görsel gerekiyor, toplam MAX_ROUNDS * 3 görsel lazım
+            needed_images = self.MAX_ROUNDS * 3
+            while len(self.available_images) < needed_images:
+                self.available_images.extend(self.available_images)
+
+            random.shuffle(self.available_images)
+            # İhtiyaç duyulan kadar görsel al
+            self.game_playlist = self.available_images[:needed_images]
+        else:
+            self.game_playlist = []
+
+        self.start_next_round()
+
+    def load_image(self, image_path):
+        """Bir görseli yükler ve boyutlandırır"""
+        try:
+            img = pygame.image.load(image_path)
+            img_w, img_h = img.get_size()
+            scale_ratio = min(500 / img_w, 400 / img_h)
+            new_size = (int(img_w * scale_ratio), int(img_h * scale_ratio))
+            return pygame.transform.scale(img, new_size)
+        except:
+            fallback = pygame.Surface((400, 300))
+            fallback.fill((100, 100, 100))
+            font = pygame.font.Font(None, 32)
+            txt = font.render("Resim Yok!", True, (255, 0, 0))
+            fallback.blit(txt, (140, 140))
+            return fallback
+
+    def start_next_round(self):
+        """Yeni bir round başlatır - 3 görsel yükler"""
+        self.user_text = ""
+        self.ai_caption = ""
+        self.similarity_score = 0
+        self.current_round += 1
+
+        if self.current_round > self.MAX_ROUNDS:
+            self.state = "GAME_OVER"
+            return
+
+        # Bu round için 3 görsel yükle
+        start_idx = (self.current_round - 1) * 3
+        self.round_images = []
+        self.round_image_paths = []
+
+        for i in range(3):
+            if start_idx + i < len(self.game_playlist):
+                img_name = self.game_playlist[start_idx + i]
+                img_path = os.path.join(self.photo_folder, img_name)
+                loaded_img = self.load_image(img_path)
+                self.round_images.append(loaded_img)
+                self.round_image_paths.append(img_path)
+            else:
+                # Fallback görsel
+                fallback = pygame.Surface((400, 300))
+                fallback.fill((100, 100, 100))
+                font = pygame.font.Font(None, 32)
+                txt = font.render("Resim Yok!", True, (255, 0, 0))
+                fallback.blit(txt, (140, 140))
+                self.round_images.append(fallback)
+                self.round_image_paths.append(None)
+
+        # Rastgele bir görsel seç (1, 2 veya 3)
+        self.selected_image_index = random.randint(0, 2)
+        self.selected_image_path = self.round_image_paths[self.selected_image_index]
+
+        # İlk görseli göster
+        self.current_image_index = 0
+        self.current_image = self.round_images[0]
+        self.state = "SHOW_IMAGES"
+        self.start_time = time.time()
+        self.display_duration = 10
+
+    def similarity(self, a, b):
+        return SequenceMatcher(None, a.lower(), b.lower()).ratio() * 100
+
+    def generate_caption(self):
+        if not self.selected_image_path: return "Resim yok."
+        try:
+            raw_image = Image.open(self.selected_image_path).convert('RGB')
+            inputs = self.processor(raw_image, return_tensors="pt").to(self.device)
+            out = self.model.generate(**inputs)
+            return self.processor.decode(out[0], skip_special_tokens=True)
+        except Exception as e:
+            return f"Hata: {str(e)}"
+
+    def run(self):
+        font = pygame.font.Font(None, 36)
+        small_font = pygame.font.Font(None, 24)
+        input_box = pygame.Rect(self.width // 2 - 200, self.height // 2, 400, 50)
+
+        while self.running:
+            self.screen.fill((30, 30, 30))
+            current_time = time.time()
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT: return False
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE: return False
+
+                    if self.state == "INPUT":
+                        if event.key == pygame.K_RETURN:
+                            self.state = "PROCESSING"
+                        elif event.key == pygame.K_BACKSPACE:
+                            self.user_text = self.user_text[:-1]
+                        else:
+                            self.user_text += event.unicode
+
+                    elif self.state == "RESULT":
+                        # Sonuç ekranında Enter'a basarsa sonraki round'a geç
+                        if event.key == pygame.K_RETURN:
+                            if self.current_round < self.MAX_ROUNDS:
+                                self.start_next_round()
+                            else:
+                                self.state = "GAME_OVER"
+
+            # --- EKRAN DURUMLARI ---
+
+            if self.state == "SHOW_IMAGES":
+                elapsed = current_time - self.start_time
+                remaining = max(0, self.display_duration - elapsed)
+
+                # Hangi görsel gösteriliyor (1, 2 veya 3)
+                image_num = self.current_image_index + 1
+                info = font.render(
+                    f"Round {self.current_round}/{self.MAX_ROUNDS} - Görsel {image_num}/3 - Incele: {int(remaining)} sn",
+                    True,
+                    (255, 200, 50))
+                self.screen.blit(info, (self.width // 2 - 200, 50))
+
+                if self.current_image:
+                    rect = self.current_image.get_rect(center=(self.width // 2, self.height // 2))
+                    self.screen.blit(self.current_image, rect)
+
+                # 20 saniye doldu mu?
+                if remaining <= 0:
+                    # Bir sonraki görsele geç
+                    self.current_image_index += 1
+                    if self.current_image_index < 3:
+                        # Hala görsel var, bir sonrakini göster
+                        self.current_image = self.round_images[self.current_image_index]
+                        self.start_time = time.time()
+                    else:
+                        # 3 görsel de gösterildi, şimdi soru sorma ekranına geç
+                        self.state = "INPUT"
+
+            elif self.state == "INPUT":
+                # Rastgele seçilen görselin numarasını söyle
+                selected_num = self.selected_image_index + 1
+                question_text = font.render(f"{selected_num}. fotografi Ingilizce betimle:", True, (255, 255, 255))
+                self.screen.blit(question_text, (self.width // 2 - 200, self.height // 2 - 50))
+
+                pygame.draw.rect(self.screen, (255, 255, 255), input_box, 2)
+                self.screen.blit(font.render(self.user_text, True, (255, 255, 255)),
+                                 (input_box.x + 5, input_box.y + 10))
+                self.screen.blit(small_font.render("Onaylamak icin ENTER'a bas", True, (150, 150, 150)),
+                                 (self.width // 2 - 100, self.height // 2 + 60))
+
+            elif self.state == "PROCESSING":
+                self.screen.blit(font.render("Yapay Zeka Analiz Ediyor...", True, (0, 255, 255)),
+                                 (self.width // 2 - 150, self.height // 2))
+                pygame.display.flip()
+
+                self.ai_caption = self.generate_caption()
+                self.similarity_score = self.similarity(self.user_text, self.ai_caption)
+                self.total_score += self.similarity_score
+                self.state = "RESULT"
+
+            elif self.state == "RESULT":
+                res_font = pygame.font.Font(None, 32)
+                self.screen.blit(res_font.render(f"Senin Cevabin: {self.user_text}", True, (200, 200, 200)), (50, 100))
+                self.screen.blit(res_font.render(f"AI Cevabi: {self.ai_caption}", True, (50, 255, 100)), (50, 150))
+
+                col = (0, 255, 0) if self.similarity_score > 50 else (255, 50, 50)
+                self.screen.blit(font.render(f"Bu Tur Puanin: %{self.similarity_score:.2f}", True, col), (50, 250))
+
+                if self.current_round < self.MAX_ROUNDS:
+                    msg = "SIRADAKI ROUND ICIN ENTER'A BAS"
+                else:
+                    msg = "OYUNU BITIRMEK ICIN ENTER'A BAS"
+
+                # Yanıp sönen yazı efekti
+                if int(time.time() * 2) % 2 == 0:
+                    self.screen.blit(font.render(msg, True, (255, 255, 0)), (50, 350))
+
+            elif self.state == "GAME_OVER":
+                avg_score = self.total_score / self.MAX_ROUNDS
+
+                title = pygame.font.Font(None, 64).render("OYUN BITTI!", True, (0, 255, 255))
+                self.screen.blit(title, (self.width // 2 - 130, 150))
+
+                res_txt = font.render(f"Ortalama Basari: %{avg_score:.2f}", True, (255, 255, 255))
+                self.screen.blit(res_txt, (self.width // 2 - 120, 250))
+
+                self.screen.blit(small_font.render("Menuye donmek icin ESC'ye bas", True, (150, 150, 150)),
+                                 (self.width // 2 - 100, 400))
+
+            pygame.display.flip()
+            self.clock.tick(30)
+        return True
+
+
+class GameManager:
+    def __init__(self):
+        pygame.init()
+        self.width = 800
+        self.height = 600
+        self.screen = pygame.display.set_mode((self.width, self.height))
+        pygame.display.set_caption("NeuroFocus - AI Destekli Eğitim")
+        self.clock = pygame.time.Clock()
         self.running = True
         self.bg_color = (20, 30, 40)
-        self.circle_color = (100, 200, 255)
-        self.active_color = (255, 200, 50)  # Tek renk - sarı
-        
-        # Daireler
-        self.num_circles = 12
-        self.circle_radius = 30
-        self.center_x = width // 2
-        self.center_y = height // 2
-        self.circle_radius_distance = 150
-        
-        # Oyun mantığı
-        self.current_index = 0
-        self.jump_interval = 1.0  # Saniye - yavaşlatıldı
-        self.last_jump_time = time.time()
-        self.jump_count = 0  # Kaç daire atlandı (1 veya 2)
-        self.score = 0
-        
-        # İkişer atlama kontrolü
-        self.is_double_jump = False
-        self.double_jump_chance = 0.3  # %30 şans
-        self.double_jump_start_time = None
-        self.double_jump_timeout = 2.0  # 2 saniye süre
-        self.missed_message_time = None
-        self.missed_message_duration = 1.5  # "Kaçırdın" mesajı 1.5 saniye gösterilsin
-        self.wrong_press_time = None
-        self.wrong_press_duration = 1.5  # "Yanlış bastınız" mesajı 1.5 saniye gösterilsin
-        
-        # Zamanlayıcı
-        self.game_duration = 180  # 3 dakika = 180 saniye
-        self.start_time = time.time()
-        
-    def run(self):
-        """Ana oyun döngüsü"""
-        font = pygame.font.Font(None, 48)
-        small_font = pygame.font.Font(None, 24)
-        large_font = pygame.font.Font(None, 72)
-        
-        self.start_time = time.time()
-        
-        while self.running:
-            current_time = time.time()
-            elapsed_time = current_time - self.start_time
-            remaining_time = max(0, self.game_duration - elapsed_time)
-            
-            if remaining_time <= 0:
-                self.running = False
-                break
-            
+
+    def show_main_menu(self):
+        title_font = pygame.font.Font(None, 64)
+        button_font = pygame.font.Font(None, 48)
+
+        plane_rect = pygame.Rect(self.width // 2 - 150, 200, 300, 60)
+        desc_rect = pygame.Rect(self.width // 2 - 150, 280, 300, 60)
+
+        selected_game = None
+
+        while selected_game is None and self.running:
+            mouse_pos = pygame.mouse.get_pos()
+            mouse_clicked = False
+
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
-                    return False
+                    self.running = False
+                    return None
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    if event.button == 1: mouse_clicked = True
                 elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_ESCAPE:
-                        return False
-                    elif event.key == pygame.K_BACKSPACE:
-                        return True
-                    elif event.key == pygame.K_SPACE:
-                        # Boşluğa basıldı
-                        if self.is_double_jump and self.double_jump_start_time is not None:
-                            # Çift atlama sırasında basıldı mı?
-                            time_since_double = current_time - self.double_jump_start_time
-                            if time_since_double <= self.double_jump_timeout:
-                                # ZAMANINDA BASILDI!
-                                self.score += 10
-                                self.is_double_jump = False
-                                self.double_jump_start_time = None
-                            # Zaman geçtiyse zaten aşağıdaki döngüde "kaçırdın" mesajı verilecek
-                        else:
-                            # Yanlış zamanda basıldı (Tek atlama sırasında)
-                            self.wrong_press_time = current_time
-            
-            # Zaman kontrolü ve Atlama Mantığı
-            if current_time - self.last_jump_time >= self.jump_interval:
-                self.last_jump_time = current_time
-                
-                # --- YENİ DÜZENLEME: KAÇIRMA KONTROLÜ ---
-                # Eğer yeni bir atlama sırası geldiyse ve hala bir önceki çift atlama (double jump)
-                # aktifse, demek ki kullanıcı boşluğa basmayı unuttu veya kaçırdı.
-                if self.is_double_jump:
-                     self.missed_message_time = current_time # Mesajı tetikle
-                     self.is_double_jump = False # Durumu sıfırla
-                     self.double_jump_start_time = None
+                    if event.key == pygame.K_1:
+                        selected_game = "plane"
+                    elif event.key == pygame.K_2:
+                        selected_game = "description"
+                    elif event.key == pygame.K_ESCAPE:
+                        self.running = False
+                        return None
 
-                # Yeni atlama türünü belirle (Tek mi Çift mi?)
-                if np.random.random() < self.double_jump_chance:
-                    self.jump_count = 2
-                    self.is_double_jump = True
-                    self.double_jump_start_time = current_time # Süreyi başlat
-                else:
-                    self.jump_count = 1
-                    self.is_double_jump = False
-                    self.double_jump_start_time = None
-                
-                self.current_index = (self.current_index + self.jump_count) % self.num_circles
-            
-            # Ekranı temizle
             self.screen.fill(self.bg_color)
-            
-            # Daireleri Çiz
-            for i in range(self.num_circles):
-                angle = (2 * np.pi * i) / self.num_circles
-                x = self.center_x + self.circle_radius_distance * np.cos(angle)
-                y = self.center_y + self.circle_radius_distance * np.sin(angle)
-                
-                if i == self.current_index:
-                    color = self.active_color
-                    pygame.draw.circle(self.screen, color, (int(x), int(y)), self.circle_radius)
-                    pygame.draw.circle(self.screen, (255, 255, 255), (int(x), int(y)), self.circle_radius, 3)
-                else:
-                    pygame.draw.circle(self.screen, self.circle_color, (int(x), int(y)), self.circle_radius)
-                    pygame.draw.circle(self.screen, (150, 150, 150), (int(x), int(y)), self.circle_radius, 2)
-            
-            # Süre Yazısı
-            minutes = int(remaining_time // 60)
-            seconds = int(remaining_time % 60)
-            time_text = font.render(f"Süre: {minutes:02d}:{seconds:02d}", True, (255, 255, 255))
-            self.screen.blit(time_text, (10, 10))
-            
-            # --- MESAJLAR ---
-            
-            # "KAÇIRDIN!" Mesajı
-            if self.missed_message_time is not None:
-                if current_time - self.missed_message_time < self.missed_message_duration:
-                    missed_text = large_font.render("KAÇIRDIN!", True, (255, 50, 50)) # Kırmızı
-                    missed_rect = missed_text.get_rect(center=(self.width // 2, self.height // 2))
-                    self.screen.blit(missed_text, missed_rect)
-                else:
-                    self.missed_message_time = None
-            
-            # "YANLIŞ BASTINIZ!" Mesajı
-            if self.wrong_press_time is not None:
-                if current_time - self.wrong_press_time < self.wrong_press_duration:
-                    wrong_text = large_font.render("YANLIŞ!", True, (255, 150, 0)) # Turuncu
-                    wrong_rect = wrong_text.get_rect(center=(self.width // 2, self.height // 2))
-                    self.screen.blit(wrong_text, wrong_rect)
-                else:
-                    self.wrong_press_time = None
-            
-            # Alt Bilgiler
-            inst_text = small_font.render("2 birim atlarsa BOŞLUK tuşuna bas", True, (200, 200, 200))
-            inst_rect = inst_text.get_rect(center=(self.width // 2, self.height - 50))
-            self.screen.blit(inst_text, inst_rect)
-            
-            back_text = small_font.render("Geri: Backspace | Çıkış: ESC", True, (150, 150, 150))
-            back_rect = back_text.get_rect(center=(self.width // 2, self.height - 20))
-            self.screen.blit(back_text, back_rect)
-            
-            # Oyun Sonu
-            if not self.running:
-                game_over_text = font.render("Süre Doldu!", True, (255, 200, 0))
-                text_rect = game_over_text.get_rect(center=(self.width // 2, self.height // 2 - 50))
-                self.screen.blit(game_over_text, text_rect)
-                
-                final_score_text = font.render(f"Final Skor: {self.score}", True, (255, 255, 255))
-                score_rect = final_score_text.get_rect(center=(self.width // 2, self.height // 2))
-                self.screen.blit(final_score_text, score_rect)
-                
-                pygame.display.flip()
-                pygame.time.wait(3000)
-                return True
-            
+            title = title_font.render("NEURO FOCUS", True, (255, 255, 255))
+            self.screen.blit(title, (self.width // 2 - 150, 80))
+
+            col1 = (70, 170, 70) if plane_rect.collidepoint(mouse_pos) else (50, 150, 50)
+            pygame.draw.rect(self.screen, col1, plane_rect, border_radius=10)
+            self.screen.blit(button_font.render("1. Odak Uçagi", True, (255, 255, 255)),
+                             (plane_rect.x + 40, plane_rect.y + 15))
+
+            col3 = (70, 170, 170) if desc_rect.collidepoint(mouse_pos) else (50, 150, 150)
+            pygame.draw.rect(self.screen, col3, desc_rect, border_radius=10)
+            self.screen.blit(button_font.render("2. Görsel Betimle", True, (255, 255, 255)),
+                             (desc_rect.x + 20, desc_rect.y + 15))
+
+            if mouse_clicked:
+                if plane_rect.collidepoint(mouse_pos):
+                    selected_game = "plane"
+                elif desc_rect.collidepoint(mouse_pos):
+                    selected_game = "description"
+
             pygame.display.flip()
             self.clock.tick(60)
-        
-        return True  # Menüye dön
+
+        return selected_game
+
+    def run(self):
+        while self.running:
+            selected = self.show_main_menu()
+            if not self.running or selected is None: break
+
+            if selected == "plane":
+                game = PlaneGame(self.screen, self.width, self.height, self.clock)
+                game.run()
+            elif selected == "description":
+                game = ImageDescriptionGame(self.screen, self.width, self.height, self.clock)
+                game.run()
+
+        pygame.quit()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
@@ -831,8 +626,8 @@ if __name__ == "__main__":
         manager = GameManager()
         manager.run()
     except Exception as e:
-        print(f"Program başlatma hatası: {e}")
+        print(f"Hata: {e}")
         import traceback
-        traceback.print_exc()
-        input("Çıkmak için Enter'a basın...")
 
+        traceback.print_exc()
+        input("Cikmak icin Enter...")
